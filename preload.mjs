@@ -2268,7 +2268,7 @@ globalThis.fetch = async function (url, options) {
             }
             return true;
           });
-          if (kept.length !== msg.content.length) msg.content = kept;
+          if (kept.length !== msg.content.length && kept.length > 0) msg.content = kept;
         }
         if (trailerStripped > 0) {
           modified = true;
@@ -2340,7 +2340,7 @@ globalThis.fetch = async function (url, options) {
             }
             return true;
           });
-          if (kept.length !== msg.content.length) msg.content = kept;
+          if (kept.length !== msg.content.length && kept.length > 0) msg.content = kept;
         }
         if (reminderStripped > 0) {
           modified = true;

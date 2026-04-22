@@ -1,5 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 let registry = [];
 
@@ -16,7 +17,7 @@ export async function loadExtensions(dir, configPath) {
   const extensions = [];
   for (const file of mjsFiles) {
     try {
-      const mod = await import(join(dir, file) + "?t=" + Date.now());
+      const mod = await import(pathToFileURL(join(dir, file)).href + "?t=" + Date.now());
       const ext = mod.default;
       if (!ext || !ext.name) continue;
 
