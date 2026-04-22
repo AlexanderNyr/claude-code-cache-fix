@@ -2,7 +2,7 @@
 
 Issues we are actively monitoring, have commented on, or are directly relevant to our interceptor work.
 
-Last updated: 2026-04-18 (post v2.0.3 release, v2.1.113 Bun migration)
+Last updated: 2026-04-22 (v3.0.1 proxy shipped, v2.1.117 upgrade, Q7d binding constraint confirmed)
 
 ## Legend
 
@@ -24,13 +24,13 @@ Last updated: 2026-04-18 (post v2.0.3 release, v2.1.113 Bun migration)
 | [#44045](https://github.com/anthropics/claude-code/issues/44045) | Prompt cache partial miss on every --resume turn | Open | Posted interceptor data, confirmed skill_listing block scatter (2026-04-08). bilby91 tested interceptor — 1h TTL works, found 1-char tool diff in Agent SDK. Asked for details (2026-04-09). |
 | [#44724](https://github.com/anthropics/claude-code/issues/44724) | Subagent cache miss on first SendMessage resume | Open | Posted analysis — cache_read=0 suggests system prompt differs between Agent and SendMessage, not just block scatter. Asked for mitmproxy diff. (2026-04-08) |
 | [#42542](https://github.com/anthropics/claude-code/issues/42542) | Silent context degradation — microcompact, cached microcompact, session memory compact | Open | Posted interceptor monitoring data — 0 microcompact events in 4,700+ calls, 84 budget warnings, confirmed no DISABLE_MICROCOMPACT. (2026-04-08) |
-| [#45188](https://github.com/anthropics/claude-code/issues/45188) | System prompt grew ~70K tokens between v2.1.89 and v2.1.96 | Open | Posted comparison data — no growth on minimal setup between v2.1.92 and v2.1.96; growth is plugin-amplified. Added prompt size measurement feature. (2026-04-08) |
-| [#41930](https://github.com/anthropics/claude-code/issues/41930) | Critical: Widespread abnormal usage drain — multiple root causes | Open | Posted interceptor data corroborating root causes (2026-04-08). Source code analysis of "API Usage Billing" header, auth fallback vs token behavior (2026-04-09). Replied to marcuspuchalla (tool search) and Adanielyan92 (interceptor) (2026-04-09). |
+| [#45188](https://github.com/anthropics/claude-code/issues/45188) | System prompt grew ~70K tokens between v2.1.89 and v2.1.96 | Open | Posted comparison data — no growth on minimal setup between v2.1.92 and v2.1.96; growth is plugin-amplified. Added prompt size measurement feature. (2026-04-08). Replied to AlfredGuquan re: skill listing duplication on resume — 8+ injections per session, ~3-4K each (2026-04-19). |
+| [#41930](https://github.com/anthropics/claude-code/issues/41930) | Critical: Widespread abnormal usage drain — multiple root causes | Open | Posted interceptor data corroborating root causes (2026-04-08). Source code analysis of "API Usage Billing" header, auth fallback vs token behavior (2026-04-09). Replied to marcuspuchalla (tool search) and Adanielyan92 (interceptor) (2026-04-09). **New Apr 20:** lemagus posted Pro plan drain — 64.8M cache_read tokens in one session, 77,000x ratio, wiped monthly Pro quota in one morning. Bug now hitting beyond Max tier. TidyWeb, vryugal, przadka, dw2021 also reporting. |
 | [#34556](https://github.com/anthropics/claude-code/issues/34556) | Persistent memory across context compactions | Open | Shared our memory system approach — MEMORY.md index + typed topic files with YAML frontmatter. (2026-04-08) |
 | [#45572](https://github.com/anthropics/claude-code/issues/45572) | CLI usage classified as API billing on Max | Open | Posted isClaudeAISubscriber() source analysis — none of the false conditions apply to their setup. Suggested subprocess auth context and Apr 4 backend regression. Offered interceptor for instrumentation. (2026-04-09) |
 | [#44869](https://github.com/anthropics/claude-code/issues/44869) | Prompt cache completely broken — 16-26K on "hello" | Open | Posted root cause explanation (readdir jitter, resume scatter, TTL gating) and interceptor fix. (2026-04-09) |
 | [#43657](https://github.com/anthropics/claude-code/issues/43657) | Resume/continue cache invalidation | **Reopened** | Was closed, simpolism claimed "fixed in 2.1.97" — we posted test data showing scatter still present. Reopened after our comment. (2026-04-09) |
-| [#45756](https://github.com/anthropics/claude-code/issues/45756) | Pro Max 5x quota exhausted in 1.5h — cache_read counting at full rate? | Open | Defended against bot auto-closure. Shared v1.6.1 quota tracking, validated molu0219's analysis, collecting off-peak data. (2026-04-09) |
+| [#45756](https://github.com/anthropics/claude-code/issues/45756) | Pro Max 5x quota exhausted in 1.5h — cache_read counting at full rate? | Open | Defended against bot auto-closure. Shared v1.6.1 quota tracking, validated molu0219's analysis, collecting off-peak data. (2026-04-09). **New Apr 21:** nikhilsitaram called out Anthropic's 1h→5m TTL switch contradiction — Boris references 1h windows but server enforces 5m. |
 
 ## Monitoring — Directly relevant
 
@@ -72,6 +72,8 @@ Last updated: 2026-04-18 (post v2.0.3 release, v2.1.113 Bun migration)
 
 | # | Title | State | Our involvement |
 |---|-------|-------|-----------------|
+| [#50513](https://github.com/anthropics/claude-code/issues/50513) | Complex engineering behavior regression across sessions | Open | Posted Priority E follow-up with three-dataset convergence (Apr 22). ArkNill posted 38,996-request dataset with GrowthBook feature flag causal evidence — toggling flags dropped truncation/clearing events to zero across 9,996 requests. YuriyKrasilnikov maintaining evidence map. |
+| [#52002](https://github.com/anthropics/claude-code/issues/52002) | Agent-initiated compaction (feature request) | Open | Filed by us (Apr 22). No comments yet. |
 | [#47098](https://github.com/anthropics/claude-code/issues/47098) | New sessions will NEVER hit a full cache | Open | Posted interceptor layer coverage breakdown (Apr 17). wadabum cross-linked #50085 (attribution header). |
 | [#38335](https://github.com/anthropics/claude-code/issues/38335) | Max plan limits exhausted abnormally fast | Open | Posted v2.1.113 proxy path forward (Apr 18). 466+ comments mega-thread. |
 | [#42796](https://github.com/anthropics/claude-code/issues/42796) | Claude Code unusable for complex engineering (Feb updates) | Closed | OP is Stella Laurenzo (AMD AI team). Adaptive thinking regression. fgrosswig referenced re: 4.7 changes. |
@@ -98,7 +100,7 @@ Last updated: 2026-04-18 (post v2.0.3 release, v2.1.113 Bun migration)
 
 | Resource | Author | Relevance |
 |----------|--------|-----------|
-| [claude-code-hidden-problem-analysis](https://github.com/ArkNill/claude-code-hidden-problem-analysis) | @ArkNill | 7 bugs: microcompact, budget caps, false rate limiter, JSONL duplication, extended thinking quota |
+| [claude-code-hidden-problem-analysis](https://github.com/ArkNill/claude-code-hidden-problem-analysis) | @ArkNill | 7 bugs: microcompact, budget caps, false rate limiter, JSONL duplication, extended thinking quota. **New:** 38,996-request dataset (Apr 1-16), GrowthBook feature flag causal test (truncation/clearing → zero when flags toggled), Opus 4.7 2.4x burn advisory. Pivoting to llm-relay (multi-provider). |
 | [X-Ray-Claude-Code-Interceptor](https://github.com/Renvect/X-Ray-Claude-Code-Interceptor) | @Renvect | HTTPS proxy with dashboard, system prompt diffing, per-tool stripping thresholds |
 | [claude-usage-dashboard](https://github.com/fgrosswig/claude-usage-dashboard) | @fgrosswig | Self-hosted dashboard with SSE live monitoring, multi-host aggregation, forced-restart detection, compaction analysis, quadratic cost modeling. v1.4.0 shipped 2026-04-11. Reads from `~/.claude/projects/**/*.jsonl` + optional HTTP proxy. Complementary vantage point to our in-process interceptor. Includes `scripts/scrub-for-public.sh` for log sanitization before sharing. |
 | [NEXO Brain](https://github.com/wazionapps/nexo) | @wazionapps | MCP-based "shared brain" for AI agents. Persistent memory, semantic RAG, natural forgetting, metacognitive guard, trust scoring, 150+ MCP tools. Works with Claude Code, Codex, Claude Desktop & any MCP client. 100% local, open source, npm `nexo-brain`. **License: AGPL-3.0** — safe to reference the architecture but deep integration contaminates downstream code. Benchmarked on LoCoMo (F1 0.588, +55% vs GPT-4). Adjacent to the "curated brain" concept in `project_curated_brain.md` memory but from a different angle (passive accumulation vs. deliberate curation). Monday-queue item: ship a `claude-meter → NEXO` data exporter since we produce structured per-call telemetry that NEXO can ingest for free without touching their AGPL code. |
@@ -130,6 +132,10 @@ Last updated: 2026-04-18 (post v2.0.3 release, v2.1.113 Bun migration)
 | @wadabum | Cache layer analysis (#47098), attribution header discovery (#50085), `ANTHROPIC_BASE_URL` subscription auth concern (#35). Key architectural thinker. |
 | @cowwoc | First to report v2.1.113 Bun binary switch (#35). Suggested proxy refactor. |
 | @stellaraccident | AMD AI team lead. Filed #42796 (Claude Code unusable for complex engineering). High-visibility signal on adaptive thinking regression. |
+| @lemagus | First documented **Pro plan** quota drain with hard ccusage data (#41930, Apr 20). 64.8M cache_read tokens in one session, 77,000x ratio, wiped monthly Pro quota in a morning. Proves drain extends beyond Max tier. |
+| @nikhilsitaram | Called out Anthropic's 1h→5m TTL contradiction (#45756, Apr 21) — Boris references 1h cache windows while server enforces 5m. |
+| @AlfredGuquan | Documented skill listing duplication on resume (#45188, Apr 19) — 8+ injections per session, ~3-4K tokens each. |
+| @YuriyKrasilnikov | Maintaining evidence map and appendix on #50513. Engaged ArkNill for cross-validation. |
 
 ## Media Coverage
 
@@ -162,6 +168,17 @@ Users who have confirmed the interceptor resolved their issue:
 |---|-------|-------|---------------|
 | [#47098](https://github.com/anthropics/claude-code/issues/47098) | New sessions will NEVER hit a full cache | Open | Skills + CLAUDE.md blocks in `messages[0]` are not prefix-cacheable. Regenerated non-deterministically on fresh session / `/clear`. 6,505+ tokens of cache_creation even seconds after prior session. Separate from TTL issue — prefix placement problem. **Our issue #12.** |
 | [#47107](https://github.com/anthropics/claude-code/issues/47107) | Uncachable system prompt caused by git status | Open | `includeGitInstructions` (default: true) injects live `git status` into `system[]`. Every file edit busts the entire system-prompt cache prefix. **Our issue #11.** |
+
+### Completed (2026-04-22 — v3.0.1 shipped, issue sweep)
+- **v3.0.1 proxy shipped to npm**, v3.0.0 proxy architecture issue #40 closed.
+- **v3.1.0 milestone created** — #47 (overage warning), #48 (systemd service), #39 (upstream detection) tagged.
+- #50513: Priority E follow-up posted with three-dataset convergence data. ArkNill responded with 38,996-request GrowthBook causal evidence.
+- #45188: Replied to AlfredGuquan (skill listing duplication, 8+ injections per session).
+- #52002: Filed agent-initiated compaction feature request.
+- **Sweep findings (no action taken):**
+  - #41930: Pro plan drain now documented (lemagus, 64.8M cache_read). Bug spreading beyond Max tier.
+  - #45756: nikhilsitaram flagged 1h→5m TTL contradiction in Anthropic's own messaging.
+  - No Anthropic engineer responses on any tracked issue since Apr 18.
 
 ### Completed (2026-04-12 morning — Sunday check-in)
 - #38335: Replied to @ssougnez with v2.1.81 pin instructions + interceptor recommendation + soft ask for fallback-percentage data contribution.
