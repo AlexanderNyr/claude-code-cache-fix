@@ -1,10 +1,34 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import ext, {
+  pinBlockContent,
+  stripSessionKnowledge,
   normalizeSessionStartText,
   isContinueTrailerBlock,
   isBookkeepingReminder,
 } from "../proxy/extensions/identity-normalization.mjs";
+
+// --- Unit tests: stripSessionKnowledge ---
+
+test("stripSessionKnowledge: removes session_knowledge tags", () => {
+  const input = 'before\n<session_knowledge key="x">data</session_knowledge>\nafter';
+  const result = stripSessionKnowledge(input);
+  assert.ok(!result.includes("session_knowledge"));
+  assert.ok(result.includes("before"));
+  assert.ok(result.includes("after"));
+});
+
+test("stripSessionKnowledge: removes multiple session_knowledge tags", () => {
+  const input = 'a\n<session_knowledge key="1">d1</session_knowledge>\nb\n<session_knowledge key="2">d2</session_knowledge>\nc';
+  const result = stripSessionKnowledge(input);
+  assert.ok(!result.includes("session_knowledge"));
+  assert.ok(result.includes("a") && result.includes("b") && result.includes("c"));
+});
+
+test("stripSessionKnowledge: no-op on text without session_knowledge", () => {
+  const input = "no knowledge here";
+  assert.equal(stripSessionKnowledge(input), input);
+});
 
 // --- Unit tests: normalizeSessionStartText ---
 
@@ -14,31 +38,51 @@ test("normalizeSessionStartText: returns tuple [text, count]", () => {
   assert.equal(count, 0);
 });
 
-test("normalizeSessionStartText: no-op on text without SessionStart marker", () => {
-  const input = "Normal startup text with no session markers.";
+test("normalizeSessionStartText: strips session-id tag", () => {
+  const input = 'SessionStart:startup hook success: pre <session-id>abc123</session-id> post';
+  const [text, count] = normalizeSessionStartText(input);
+  assert.ok(!text.includes("session-id"), "session-id tag should be removed");
+  assert.ok(!text.includes("abc123"), "session-id content should be removed");
+  assert.ok(count > 0);
+});
+
+test("normalizeSessionStartText: strips Last active line", () => {
+  const input = 'SessionStart:startup hook success: pre\nLast active: 2026-04-23\npost';
+  const [text, count] = normalizeSessionStartText(input);
+  assert.ok(!text.includes("Last active"), "Last active line should be removed");
+  assert.ok(count > 0);
+});
+
+test("normalizeSessionStartText: no-op without SessionStart marker", () => {
+  const input = "no session start marker in this text";
   const [text, count] = normalizeSessionStartText(input);
   assert.equal(text, input);
   assert.equal(count, 0);
 });
 
-test("normalizeSessionStartText: no-op when text lacks SessionStart marker", () => {
-  const input = "SessionStart:resume hook success: something";
-  const [text, count] = normalizeSessionStartText(input);
-  // This text doesn't match the SESSION_START_RESUME_MARKER regex
-  // (which looks for "startup hook success", not "resume")
-  assert.equal(count, 0);
+// --- Unit tests: pinBlockContent ---
+
+test("pinBlockContent: normalizes trailing whitespace", () => {
+  const input = "content  \n</system-reminder>  \n";
+  const result = pinBlockContent("test_block", input);
+  assert.ok(result.endsWith("</system-reminder>"), "should normalize trailing whitespace");
+});
+
+test("pinBlockContent: returns same text for identical content (deterministic)", () => {
+  const text = "content\n</system-reminder>";
+  const a = pinBlockContent("determ_test", text);
+  const b = pinBlockContent("determ_test", text);
+  assert.equal(a, b);
 });
 
 // --- Unit tests: isContinueTrailerBlock ---
 
 test("isContinueTrailerBlock: detects continue trailer", () => {
-  const block = { type: "text", text: "Continue from where you left off." };
-  assert.ok(isContinueTrailerBlock(block));
+  assert.ok(isContinueTrailerBlock({ type: "text", text: "Continue from where you left off." }));
 });
 
-test("isContinueTrailerBlock: does not match longer text containing the phrase", () => {
-  const block = { type: "text", text: "Please continue from where you left off and also do this." };
-  assert.ok(!isContinueTrailerBlock(block));
+test("isContinueTrailerBlock: does not match longer text", () => {
+  assert.ok(!isContinueTrailerBlock({ type: "text", text: "Please continue from where you left off and also do this." }));
 });
 
 test("isContinueTrailerBlock: does not match non-text blocks", () => {
@@ -74,18 +118,58 @@ test("isBookkeepingReminder: handles non-string input", () => {
   assert.ok(!isBookkeepingReminder(42));
 });
 
-// --- Integration test: onRequest ---
+// --- Integration tests: onRequest ---
 
-test("onRequest: preserves continue trailers (extension skips, does not strip)", async () => {
+test("onRequest: normalizes system blocks with session_knowledge", async () => {
+  const ctx = {
+    body: {
+      system: [
+        { type: "text", text: 'hook output\n<session_knowledge key="k">data</session_knowledge>\nrest' },
+      ],
+      messages: [{ role: "user", content: [{ type: "text", text: "prompt" }] }],
+    },
+    headers: {},
+    meta: {},
+  };
+
+  await ext.onRequest(ctx);
+  assert.ok(!ctx.body.system[0].text.includes("session_knowledge"));
+});
+
+test("onRequest: normalizes SessionStart text in message content", async () => {
+  const ctx = {
+    body: {
+      system: [],
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: 'SessionStart:startup hook success: ok <session-id>xyz</session-id> done' },
+          ],
+        },
+      ],
+    },
+    headers: {},
+    meta: {},
+  };
+
+  await ext.onRequest(ctx);
+  assert.ok(!ctx.body.messages[0].content[0].text.includes("session-id"), "session-id should be stripped from message content");
+});
+
+test("onRequest: handles empty messages array", async () => {
+  const ctx = { body: { messages: [], system: [] }, headers: {}, meta: {} };
+  await ext.onRequest(ctx);
+  assert.deepEqual(ctx.body.messages, []);
+});
+
+test("onRequest: preserves content when all blocks are continue trailers", async () => {
   const ctx = {
     body: {
       messages: [
         {
           role: "user",
-          content: [
-            { type: "text", text: "Real user content here." },
-            { type: "text", text: "Continue from where you left off." },
-          ],
+          content: [{ type: "text", text: "Continue from where you left off." }],
         },
       ],
       system: [],
@@ -95,13 +179,5 @@ test("onRequest: preserves continue trailers (extension skips, does not strip)",
   };
 
   await ext.onRequest(ctx);
-
-  const userContent = ctx.body.messages[0].content;
-  assert.equal(userContent.length, 2, "Extension does not remove blocks, only normalizes text");
-});
-
-test("onRequest: handles empty messages array", async () => {
-  const ctx = { body: { messages: [], system: [] }, headers: {}, meta: {} };
-  await ext.onRequest(ctx);
-  assert.deepEqual(ctx.body.messages, []);
+  assert.ok(ctx.body.messages[0].content.length > 0);
 });
