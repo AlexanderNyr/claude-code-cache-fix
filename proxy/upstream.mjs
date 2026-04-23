@@ -1,6 +1,8 @@
 import https from "node:https";
 import http from "node:http";
 import { URL } from "node:url";
+import { readFileSync } from "node:fs";
+import { HttpProxyAgent, HttpsProxyAgent } from "hpagent";
 import config from "./config.mjs";
 
 const STRIP_REQUEST_HEADERS = new Set([
@@ -46,6 +48,105 @@ function filterResponseHeaders(rawHeaders) {
   return headers;
 }
 
+// --- HTTP proxy and custom CA support ---
+
+const _agents = new Map();        // cache key → Agent | null
+const _loggedProxies = new Set(); // dedupe stderr "using proxy" lines per (url, isHTTPS)
+let _warnedTlsDisabled = false;
+
+function shouldBypassProxy(hostname) {
+  if (!config.noProxy) return false;
+  const list = config.noProxy.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const host = hostname.toLowerCase();
+  for (const pattern of list) {
+    if (pattern === "*") return true;
+    if (pattern.startsWith(".")) {
+      // ".example.com" matches "foo.example.com" and "example.com"
+      const bare = pattern.slice(1);
+      if (host === bare || host.endsWith(pattern)) return true;
+    } else if (host === pattern || host.endsWith("." + pattern)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function loadCa() {
+  if (!config.caFile) return undefined;
+  try {
+    return readFileSync(config.caFile);
+  } catch (err) {
+    process.stderr.write(`[upstream] CACHE_FIX_PROXY_CA_FILE read failed: ${err.message}\n`);
+    return undefined;
+  }
+}
+
+// Pick the proxy URL for an upstream, matching curl/Python/Go semantics:
+//   https upstream → HTTPS_PROXY, falling back to HTTP_PROXY if unset
+//   http  upstream → HTTP_PROXY only (HTTPS_PROXY does NOT apply to plain HTTP)
+//
+// Exported for direct unit testing — tests against the live forwardRequest path
+// can't easily reload a fresh config across cases (config is a single module
+// instance), so we expose the pure function for table-driven coverage.
+export function selectProxyUrl(isHTTPS) {
+  if (isHTTPS) return config.httpsProxy || config.httpProxy || "";
+  return config.httpProxy || "";
+}
+
+function buildAgent(isHTTPS, proxyUrl) {
+  const ca = loadCa();
+  if (proxyUrl) {
+    const opts = {
+      keepAlive: true,
+      proxy: proxyUrl,
+      rejectUnauthorized: config.rejectUnauthorized,
+      ...(ca ? { ca } : {}),
+    };
+    return isHTTPS ? new HttpsProxyAgent(opts) : new HttpProxyAgent(opts);
+  }
+  // No proxy. Only build a custom agent when CA or insecure mode warrants it;
+  // otherwise return null so Node uses its global default agent (preserves the
+  // pre-change behavior end-to-end, including connection pooling).
+  if (ca || !config.rejectUnauthorized) {
+    if (isHTTPS) {
+      return new https.Agent({
+        keepAlive: true,
+        rejectUnauthorized: config.rejectUnauthorized,
+        ...(ca ? { ca } : {}),
+      });
+    }
+    return new http.Agent({ keepAlive: true });
+  }
+  return null;
+}
+
+function getAgent(isHTTPS, hostname) {
+  if (!_warnedTlsDisabled && !config.rejectUnauthorized) {
+    _warnedTlsDisabled = true;
+    process.stderr.write(
+      `[upstream] WARNING: TLS verification disabled (CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=0). This is insecure!\n`
+    );
+  }
+
+  const bypass = shouldBypassProxy(hostname);
+  const proxyUrl = bypass ? "" : selectProxyUrl(isHTTPS);
+  const cacheKey = `${isHTTPS ? "https" : "http"}|${proxyUrl}|${config.caFile}|${config.rejectUnauthorized}`;
+
+  let agent = _agents.get(cacheKey);
+  if (agent === undefined) {
+    agent = buildAgent(isHTTPS, proxyUrl);
+    _agents.set(cacheKey, agent);
+    if (proxyUrl && !_loggedProxies.has(`${proxyUrl}|${isHTTPS}`)) {
+      _loggedProxies.add(`${proxyUrl}|${isHTTPS}`);
+      process.stderr.write(
+        `[upstream] using proxy ${proxyUrl} for ${isHTTPS ? "https" : "http"} upstream ` +
+        `(rejectUnauthorized=${config.rejectUnauthorized}, ca=${config.caFile || "default"})\n`
+      );
+    }
+  }
+  return agent;
+}
+
 export function forwardRequest(clientReq, body, signal) {
   return new Promise((resolve, reject) => {
     const upstreamUrl = new URL(clientReq.url, config.upstream);
@@ -66,6 +167,7 @@ export function forwardRequest(clientReq, body, signal) {
       method: clientReq.method,
       headers,
       timeout: config.timeout,
+      agent: getAgent(isHTTPS, upstreamUrl.hostname),
     };
 
     const upstreamReq = transport.request(options, (upstreamRes) => {
