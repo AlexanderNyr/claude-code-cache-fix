@@ -123,19 +123,61 @@ test("stabilizeFingerprint: returns null when verification fails", () => {
   assert.equal(stabilizeFingerprint([attrBlock("2.1.92.zzz")], [userMsg("text")]), null);
 });
 
-test("stabilizeFingerprint: produces correction with known fixture values", () => {
-  // Use fixture[0] text but fixture[1]'s fingerprint to create a mismatch
-  // that passes legacy verification (first msg matches fixture[1])
-  const f0 = FIXTURES[0]; // real user text
-  const f1 = FIXTURES[1]; // text that produced the old fingerprint
+test("stabilizeFingerprint: corrects drifted fingerprint from system-reminder block", () => {
+  // When first content block is a system-reminder, extractFirstMessageText gets the reminder
+  // but extractRealUserMessageText skips it and gets the real text.
+  // The old fingerprint was computed from the reminder (legacy path), which verifies,
+  // but the stable fingerprint is computed from the real text — producing a correction.
+  const reminderText = "<system-reminder>Hook output here with enough chars for fingerprint</system-reminder>";
+  const realText = "The actual user prompt with different characters for fingerprint.";
+  const version = "2.1.92";
 
-  const system = [attrBlock(`${f0.version}.${computeFingerprint(f1.text, f0.version)}`)];
-  const messages = [userMsg(f1.text), userMsg(f0.text)];
+  const oldFp = computeFingerprint(reminderText, version); // "450"
+  const expectedFp = computeFingerprint(realText, version); // "2d8"
+
+  const system = [attrBlock(`${version}.${oldFp}`)];
+  const messages = [{
+    role: "user",
+    content: [
+      { type: "text", text: reminderText },
+      { type: "text", text: realText },
+    ],
+  }];
 
   const result = stabilizeFingerprint(system, messages);
-  // extractRealUserMessageText returns the first non-reminder user text (f1.text)
-  // which matches the old fingerprint, so verification passes but no correction needed
-  // This is expected — the function only corrects when real text differs
+  assert.ok(result, "should produce a correction");
+  assert.equal(result.oldFingerprint, oldFp);
+  assert.equal(result.stableFingerprint, expectedFp);
+  assert.ok(result.newText.includes(`cc_version=${version}.${expectedFp}`));
+});
+
+test("onRequest: rewrites billing header when fingerprint drifts", async () => {
+  const reminderText = "<system-reminder>Hook output here with enough chars for fingerprint</system-reminder>";
+  const realText = "The actual user prompt with different characters for fingerprint.";
+  const version = "2.1.92";
+  const oldFp = computeFingerprint(reminderText, version);
+  const expectedFp = computeFingerprint(realText, version);
+
+  const ctx = {
+    body: {
+      system: [attrBlock(`${version}.${oldFp}`)],
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: reminderText },
+          { type: "text", text: realText },
+        ],
+      }],
+    },
+    headers: {},
+    meta: {},
+  };
+
+  await ext.onRequest(ctx);
+  assert.ok(ctx.body.system[0].text.includes(`cc_version=${version}.${expectedFp}`),
+    "billing header should be rewritten to stable fingerprint");
+  assert.ok(!ctx.body.system[0].text.includes(`cc_version=${version}.${oldFp}`),
+    "old fingerprint should be replaced");
 });
 
 // --- Integration tests: onRequest ---
