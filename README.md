@@ -89,6 +89,29 @@ curl http://127.0.0.1:9801/health
 # {"status":"ok"}
 ```
 
+### Corporate environments (proxies, custom CAs)
+
+The proxy honors the following environment variables when forwarding to `api.anthropic.com`. Behind Zscaler / Netskope / Forcepoint / Bluecoat / corporate squid, set these in the proxy's environment.
+
+| Variable | Effect |
+|----------|--------|
+| `HTTPS_PROXY` / `HTTP_PROXY` (and lowercase variants) | Routes upstream requests through the corporate HTTP CONNECT proxy. |
+| `NO_PROXY` | Comma-separated host list to bypass the proxy. Supports `*` and `.suffix.example.com`. |
+| `CACHE_FIX_PROXY_CA_FILE` | Path to a PEM file with one or more extra CA certificates (for SSL-inspecting proxies). |
+| `NODE_EXTRA_CA_CERTS` | Standard Node mechanism — also honored. |
+| `CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=0` | **Insecure escape hatch.** Disables TLS verification. Use only as a last resort while you wait for IT to provide the corp CA bundle. |
+
+Example (Windows PowerShell):
+
+```powershell
+$env:HTTPS_PROXY = 'http://proxy.corp.example:8080'
+$env:NO_PROXY    = 'localhost,127.0.0.1,.corp.example'
+$env:CACHE_FIX_PROXY_CA_FILE = 'C:\corp\zscaler-root.pem'
+node "$(npm root -g)\claude-code-cache-fix\proxy\server.mjs"
+```
+
+Stderr will print `[upstream] using proxy http://proxy.corp.example:8080 ...` on first request when the agent is wired correctly. With no proxy/CA env vars set, behavior is unchanged from earlier versions (Node default agent, system trust store).
+
 ## Quick Start: Preload (CC v2.1.112 and earlier)
 
 If you're on a Node.js-based CC version (v2.1.112 or earlier), the preload interceptor works without a proxy:
