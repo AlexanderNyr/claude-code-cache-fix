@@ -17,6 +17,8 @@ function injectTtl(block, ttlParam) {
   return block;
 }
 
+export { detectRequestType, injectTtl };
+
 export default {
   name: "ttl-management",
   description: "Inject correct TTL on cache_control markers based on detected tier",

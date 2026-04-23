@@ -76,6 +76,8 @@ function isBookkeepingReminder(text) {
   return false;
 }
 
+export { pinBlockContent, stripSessionKnowledge, normalizeSessionStartText, isContinueTrailerBlock, isBookkeepingReminder };
+
 export default {
   name: "identity-normalization",
   description: "Normalize volatile identity fields (SessionStart, Continue trailers, bookkeeping) for cache stability",
