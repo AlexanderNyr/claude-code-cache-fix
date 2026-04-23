@@ -6,7 +6,7 @@
 
 [Claude Code](https://github.com/anthropics/claude-code)용 캐시 최적화 프록시입니다. 과도한 쿼터 소모를 유발하는 프롬프트 캐시 버그를 수정하고, 요청 접두사를 안정화하며, 자동 회귀를 모니터링합니다. v2.1.113+ Bun 바이너리를 포함한 모든 CC 버전에서 동작합니다.
 
-> **v3.0.1** — 7개 핫리로드 확장을 갖춘 로컬 HTTP 프록시입니다. v2.1.117에서 A/B 테스트 결과: 첫 번째 웜 턴에서 **프록시 경유 95.5% 캐시 히트율 vs 직접 연결 82.3%**. [전체 릴리스 노트 →](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v3.0.0)
+> **v3.0.3** — 7개 핫리로드 확장을 갖춘 로컬 HTTP 프록시입니다. v2.1.117에서 A/B 테스트 결과: 첫 번째 웜 턴에서 **프록시 경유 95.5% 캐시 히트율 vs 직접 연결 82.3%**. [전체 릴리스 노트 →](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v3.0.0)
 
 > **Opus 4.7 주의사항:** 계측 데이터에 따르면 4.7은 동일한 가시 토큰 수 대비 **Q5h 쿼터를 4.6의 약 2.4배 속도로 소모**합니다([@ArkNill이 독립 확인](https://github.com/ArkNill/claude-code-hidden-problem-analysis/blob/main/16_OPUS-47-ADVISORY.md)). 두 가지 요인: 새 토크나이저(최대 35% 더 많은 토큰, [문서화됨](https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7))와 적응적 사고 오버헤드(약 105%, 사용량 응답에 미문서화). Q5h 영향은 **Q7d**(대부분의 헤비 유저가 먼저 도달하는 주간 쿼터 상한)에 복리로 누적됩니다. 우회 방법: `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1`을 설정하면 소모율이 약 3.3배 감소하지만, 복잡한 작업에서 품질이 떨어질 수 있습니다. [Discussion #25](https://github.com/cnighswonger/claude-code-cache-fix/discussions/25)(초기 관찰)와 [Discussion #42](https://github.com/cnighswonger/claude-code-cache-fix/discussions/42)(통제된 A/B 데이터 + Q7d 분석)를 참조하십시오.
 

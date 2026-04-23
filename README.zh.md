@@ -1,8 +1,147 @@
 # claude-code-cache-fix
 
-[English](./README.md) | 中文
+[![npm](https://img.shields.io/npm/v/claude-code-cache-fix?color=blue)](https://www.npmjs.com/package/claude-code-cache-fix) [![Node.js](https://img.shields.io/badge/Node.js-18%2B-green)](https://nodejs.org/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](https://opensource.org/licenses/MIT) [![GitHub stars](https://img.shields.io/github/stars/cnighswonger/claude-code-cache-fix)](https://github.com/cnighswonger/claude-code-cache-fix/stargazers)
 
-修复 [Claude Code](https://github.com/anthropics/claude-code) 中导致恢复会话时**成本增加高达 20 倍**的提示缓存回归问题，同时监控静默上下文降级。已在 v2.1.92 至 v2.1.97 上验证。
+[English](./README.md) | 中文 | [한국어](./README.ko.md) | [Português](./docs/guia-pt-br.md)
+
+[Claude Code](https://github.com/anthropics/claude-code) 的缓存优化代理。修复导致配额过度消耗的提示缓存 bug，稳定请求前缀，并监控静默回归。支持所有 CC 版本，包括 v2.1.113+ Bun 二进制文件。
+
+> **v3.0.3** — 具有 7 个热重载扩展的本地 HTTP 代理。在 v2.1.117 上 A/B 测试：首次热启动轮次 **代理经由 95.5% 缓存命中率 vs 直连 82.3%**。[完整发布说明 →](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v3.0.0)
+
+> **Opus 4.7 注意事项：** 计量数据显示 4.7 在相同可见 token 数量下 **Q5h 配额消耗速率约为 4.6 的 2.4 倍**（[@ArkNill 独立确认](https://github.com/ArkNill/claude-code-hidden-problem-analysis/blob/main/16_OPUS-47-ADVISORY.md)）。两个因素：新的分词器（最多增加 35% token，[已记录](https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7)）和自适应思考开销（约 105%，未在使用量响应中记录）。Q5h 影响会复合累积到 **Q7d** — 大多数重度用户最先触及的周配额上限。解决方法：`CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` 可将消耗降低约 3.3 倍，但可能降低复杂任务的质量。参见 [Discussion #25](https://github.com/cnighswonger/claude-code-cache-fix/discussions/25)（初始观察）和 [Discussion #42](https://github.com/cnighswonger/claude-code-cache-fix/discussions/42)（对照 A/B 数据 + Q7d 分析）。
+
+## 快速开始：代理（推荐）
+
+代理适用于任何 CC 版本 — Node.js 或 Bun 二进制文件。它位于 Claude Code 和 Anthropic API 之间，通过热重载扩展应用缓存修复。
+
+```bash
+# 安装
+npm install -g claude-code-cache-fix
+
+# 启动代理（在 localhost:9801 上运行）
+node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
+
+# 通过代理启动 Claude Code
+ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
+```
+
+就这样。代理会自动应用所有 7 个缓存修复扩展。无需包装脚本、`NODE_OPTIONS` 或预加载。
+
+### 代理的工作方式
+
+每个 `/v1/messages` 请求都会按顺序执行 7 个扩展：
+
+| 扩展 | 修复内容 |
+|------|----------|
+| `fingerprint-strip` | 移除系统提示中不稳定的 cc_version 指纹 |
+| `sort-stabilization` | 确保工具和 MCP 定义的确定性排序 |
+| `ttl-management` | 检测服务器 TTL 层级，注入正确的 cache_control 标记 |
+| `identity-normalization` | 规范化消息身份字段以保持前缀稳定性 |
+| `fresh-session-sort` | 修复首次轮次的非确定性排序 |
+| `cache-control-normalize` | 规范化消息间的 cache_control 标记 |
+| `cache-telemetry` | 从响应头提取缓存统计 → `~/.claude/quota-status.json` |
+
+扩展支持热重载 — 在 `proxy/extensions/` 中添加、删除或修改 `.mjs` 文件，更改将在下一次请求时生效，无需重启。配置在 `proxy/extensions.json` 中。
+
+### 作为服务运行
+
+**Linux（systemd — 推荐）：**
+
+创建 `~/.config/systemd/user/cache-fix-proxy.service`：
+
+```ini
+[Unit]
+Description=Claude Code Cache Fix Proxy (v3.x)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/node /path/to/claude-code-cache-fix/proxy/server.mjs
+Restart=on-failure
+RestartSec=5
+Environment=CACHE_FIX_PROXY_PORT=9801
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now cache-fix-proxy
+
+# 可选：开机启动（无需登录）
+sudo loginctl enable-linger $USER
+```
+
+v3.1.0 计划提供 `cache-fix-proxy install-service` 子命令（[#48](https://github.com/cnighswonger/claude-code-cache-fix/issues/48)）。
+
+**备选方案（任何操作系统）：**
+
+```bash
+nohup node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" > /tmp/cache-fix-proxy.log 2>&1 &
+echo 'export ANTHROPIC_BASE_URL=http://127.0.0.1:9801' >> ~/.bashrc
+```
+
+### 健康检查
+
+```bash
+curl http://127.0.0.1:9801/health
+# {"status":"ok"}
+```
+
+### 企业环境（代理、自定义 CA）
+
+代理在转发到 `api.anthropic.com` 时支持以下环境变量。在 Zscaler / Netskope / Forcepoint / Bluecoat / 企业 squid 等环境下，在代理的环境中设置这些变量。
+
+| 变量 | 效果 |
+|------|------|
+| `HTTPS_PROXY` / `HTTP_PROXY`（及小写变体） | 通过企业 HTTP CONNECT 代理路由上游请求。 |
+| `NO_PROXY` | 逗号分隔的主机列表，绕过代理。支持 `*` 和 `.suffix.example.com`。 |
+| `CACHE_FIX_PROXY_CA_FILE` | PEM 文件路径，包含一个或多个额外 CA 证书（用于 SSL 检查代理）。 |
+| `NODE_EXTRA_CA_CERTS` | Node.js 标准机制 — 同样支持。 |
+| `CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=0` | **不安全的逃生通道。** 禁用 TLS 验证。仅在等待 IT 提供企业 CA 证书包时作为最后手段使用。 |
+
+## 快速开始：预加载（CC v2.1.112 及更早版本）
+
+如果使用基于 Node.js 的 CC 版本（v2.1.112 或更早），预加载拦截器无需代理即可工作：
+
+```bash
+npm install -g claude-code-cache-fix
+NODE_OPTIONS="--import claude-code-cache-fix" claude
+```
+
+> **注意：** 预加载不适用于 CC v2.1.113+（Bun 二进制文件）。请使用上述代理方式。
+
+包装脚本、Shell 别名、Windows 说明和 VS Code 预加载模式集成请参见 [docs/preload-setup.md](docs/preload-setup.md)。
+
+## VS Code 扩展
+
+[VS Code 扩展](https://github.com/cnighswonger/claude-code-cache-fix-vscode)（v0.5.0）支持代理和预加载两种模式：
+
+**代理模式（推荐）：**
+1. 启动代理（见上文）
+2. 在 VS Code 命令面板中：**Claude Code Cache Fix: Enable Proxy Mode**
+3. 重启任何活跃的 Claude Code 会话
+
+**预加载模式（CC ≤v2.1.112）：**
+1. `npm install -g claude-code-cache-fix`
+2. 从 [GitHub Releases](https://github.com/cnighswonger/claude-code-cache-fix-vscode/releases/latest) 下载 VSIX
+3. 安装：`code --install-extension claude-code-cache-fix-0.5.0.vsix`
+4. 命令面板：**Claude Code Cache Fix: Enable**
+
+手动 VS Code 包装器设置（不使用 VSIX）请参见 [docs/preload-setup.md](docs/preload-setup.md#vs-code-preload-mode)。
+
+## 安全模型
+
+> **代理和拦截器对 API 请求和响应具有完全读写访问权限。** 这是该方法固有的特性 — 任何 fetch 拦截器、代理或网关都处于这个位置。
+
+**它做什么：** 修改出站请求结构（块排序、指纹、TTL、git-status）以修复缓存 bug。读取响应头和 SSE 使用量数据用于监控。
+
+**它不做什么：** 代理或拦截器不会发起网络调用。所有遥测数据写入 `~/.claude/` 下的本地文件。除非你明确选择加入 [claude-code-meter](https://github.com/cnighswonger/claude-code-meter) 共享（独立包，需要交互式同意），否则数据不会离开你的机器。
+
+**供应链：** 代理模式：7 个小型扩展模块在 `proxy/extensions/` 中（每个不到 200 行）。预加载模式：单个未压缩文件（`preload.mjs`，约 1,700 行）。一个开发依赖（`zod`，仅用于测试中的模式验证）。安装前请审查代码。npm 出处（provenance）将每个发布版本链接到其源代码提交。
+
+**独立审计：** 被 @TheAuditorTool [评估为"合法工具"](https://github.com/anthropics/claude-code/issues/38335#issuecomment-4244413605)（2026-04-14）。
 
 ## 问题描述
 
@@ -10,288 +149,107 @@
 
 三个 bug 导致了这个问题：
 
-1. **附件块散布** — 技能列表、MCP 服务器、延迟工具、钩子等附件块应当位于 `messages[0]` 中。恢复会话时，它们会漂移到后续消息中，改变缓存前缀。
+1. **附件块散布** — 技能列表、MCP 服务器、延迟工具、钩子等附件块应当位于 `messages[0]`。恢复会话时，它们会漂移到后续消息中，改变缓存前缀。
 
-2. **指纹不稳定** — `cc_version` 指纹（如 `2.1.92.a3f`）是根据 `messages[0]` 的内容计算的，包括元数据/附件块。当这些块发生偏移时，指纹改变，系统提示改变，缓存失效。
+2. **指纹不稳定** — `cc_version` 指纹（如 `2.1.92.a3f`）基于 `messages[0]` 的内容计算，包括元数据/附件块。当这些块偏移时，指纹改变，系统提示改变，缓存失效。
 
 3. **工具定义排序不确定** — 工具定义在不同轮次间可能以不同顺序到达，改变请求字节并使缓存键失效。
 
-此外，通过 Read 工具读取的图片会以 base64 形式持久化在对话历史中，在每次后续 API 调用时一并发送，悄然增加 token 成本。
-
-## 安装
-
-需要 Node.js >= 18，且 Claude Code 通过 npm 安装（非独立二进制文件）。
-
-```bash
-npm install -g claude-code-cache-fix
-```
-
-## 使用方法
-
-本修复以 Node.js 预加载模块的形式工作，在 API 请求离开本机之前进行拦截。
-
-### 方式 A：包装脚本（推荐）
-
-创建包装脚本（如 `~/bin/claude-fixed`）：
-
-```bash
-#!/bin/bash
-CLAUDE_NPM_CLI="$HOME/.npm-global/lib/node_modules/@anthropic-ai/claude-code/cli.js"
-
-if [ ! -f "$CLAUDE_NPM_CLI" ]; then
-  echo "Error: Claude Code npm package not found at $CLAUDE_NPM_CLI" >&2
-  echo "Install with: npm install -g @anthropic-ai/claude-code" >&2
-  exit 1
-fi
-
-exec env NODE_OPTIONS="--import claude-code-cache-fix" node "$CLAUDE_NPM_CLI" "$@"
-```
-
-```bash
-chmod +x ~/bin/claude-fixed
-```
-
-如果你的 npm 全局前缀不同，请相应调整 `CLAUDE_NPM_CLI`。使用以下命令查找：
-
-```bash
-npm root -g
-```
-
-### 方式 B：Shell 别名
-
-```bash
-alias claude='NODE_OPTIONS="--import claude-code-cache-fix" node "$(npm root -g)/@anthropic-ai/claude-code/cli.js"'
-```
-
-### 方式 C：直接调用
-
-```bash
-NODE_OPTIONS="--import claude-code-cache-fix" claude
-```
-
-> **注意**：仅在 `claude` 指向 npm/Node 安装时有效。独立二进制文件使用不同的执行路径，会绕过 Node.js 预加载。
+此外，通过 Read 工具读取的图片以 base64 形式持久化在对话历史中，在每次后续 API 调用时一并发送，悄然增加 token 成本。
 
 ## 工作原理
 
-模块在 Claude Code 向 `/v1/messages` 发起 API 调用前拦截 `globalThis.fetch`。每次调用时：
+**代理模式**（v3.0.0+）：一个位于 `localhost:9801` 的 HTTP 服务器拦截 `POST /v1/messages` 请求。七个扩展模块通过流水线处理每个请求 — 规范化块排序、剥离指纹、稳定工具排序、管理 TTL 标记。扩展是可热重载的 `.mjs` 文件，通过 `proxy/extensions.json` 配置。所有其他流量原样传递。
 
-1. **扫描所有用户消息**中的附件块（技能、MCP、延迟工具、钩子），将每种类型的最新版本移回 `messages[0]`，匹配全新会话的布局
-2. **按名称字母顺序排列工具定义**，确保确定性排序
-3. **重新计算 cc_version 指纹**，基于真实用户消息文本而非元数据/附件内容
+**预加载模式**（v2.x）：一个 Node.js `--import` 模块，在 Claude Code 发起 API 调用前修补 `globalThis.fetch`。应用相同的修复 — 扫描用户消息中的迁移块、排序工具、重新计算指纹、注入 TTL 标记。
 
-所有修复都是幂等的 — 如果无需修复，请求将原样传递。拦截器对你的对话是只读的；它只在请求到达 API 之前规范化请求结构。
+两种模式都是幂等的 — 如果无需修复，请求原样传递。两种模式都不会修改你的对话；它们只在请求到达 API 之前规范化请求结构。
 
-## 图片剥离
+## 状态栏 — 实时配额警告
 
-通过 Read 工具读取的图片以 base64 编码存储在对话历史的 `tool_result` 块中。它们会**在每次后续 API 调用中**随行发送，直到压缩。单张 500KB 的图片每轮带来约 62,500 token 的额外开销。
+代理和预加载模式都会在每次 API 调用时将配额状态写入 `~/.claude/quota-status.json`。内置的 `tools/quota-statusline.sh` 脚本显示实时状态栏：
 
-启用图片剥离以移除旧的工具结果中的图片：
+- **Q5h %** 及消耗速率（%/分钟）
+- **Q7d %** 及消耗速率（%/小时）
+- **TTL 层级** — 健康时显示 `TTL:1h`，**服务器降级时以红色显示 `TTL:5m`**（通常在 Q5h ≥ 100% 时）
+- **PEAK** 在工作日高峰时段（UTC 13:00-19:00）以黄色显示
+- **缓存命中率 %**
+- **OVERAGE** 标志（激活时）
+
+### 建议：禁用 git-status 注入
+
+Claude Code 在每次调用时将实时 `git status` 注入系统提示。任何文件编辑都会改变 git status，从而使整个前缀缓存失效。禁用此功能每次调用可节省约 1,800 token：
+
+```bash
+export CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1
+```
+
+或在 `~/.claude/settings.json` 中添加 `"includeGitInstructions": false`。社区验证者 [@wadabum](https://github.com/cnighswonger/claude-code-cache-fix/issues/11)：跨 git 状态变化仅 18 token 缓存创建（禁用前为数千 token）。
+
+## 图片剥离（预加载模式）
+
+通过 Read 工具读取的图片以 base64 持久化在对话历史中，在每次后续 API 调用时随行发送。单张 500KB 图片在 Opus 4.6 上每轮带来约 62,500 token 开销，**在 Opus 4.7 上约 85,000+ token**（因新分词器）。强烈建议在 4.7 上启用图片剥离。
 
 ```bash
 export CACHE_FIX_IMAGE_KEEP_LAST=3
 ```
 
-这将保留最近 3 条用户消息中的图片，并将较早的替换为文本占位符。仅针对 `tool_result` 块（Read 工具输出）中的图片 — 用户粘贴的图片不受影响。文件仍保留在磁盘上，需要时可重新读取。
+## 系统提示重写（预加载模式，可选）
 
-设为 `0`（默认）以禁用。
+拦截器可重写 Claude Code 的 `# Output efficiency` 系统提示段落。默认禁用。使用 `CACHE_FIX_OUTPUT_EFFICIENCY_REPLACEMENT` 启用。三种已知提示变体及使用说明请参见 [docs/output-efficiency-prompts.md](docs/output-efficiency-prompts.md)。
 
-## 系统提示词重写（可选）
+## 监控与诊断
 
-拦截器还可以在请求发出前，重写 Claude Code 的 `# Output efficiency` 系统提示词段落。
+预加载拦截器包含对微压缩降级、虚假速率限制器、GrowthBook 标志状态、使用量遥测和成本报告的监控。配额追踪在代理和预加载模式下均通过 `~/.claude/quota-status.json` 工作。
 
-此功能是**可选的**，并且**默认关闭**。如果未设置 `CACHE_FIX_OUTPUT_EFFICIENCY_REPLACEMENT`，则不会做任何修改。
-
-通过设置替换文本启用：
-
-```bash
-export CACHE_FIX_OUTPUT_EFFICIENCY_REPLACEMENT=$'# Output efficiency\n\n...'
-```
-
-该重写被刻意限制在很小的范围内：
-
-- 只替换 Claude Code 的 `# Output efficiency` 这一节
-- 其他系统提示词段落会被保留
-- 现有的 system block 结构以及 `cache_control` 等字段会被保留
-
-这对那些希望继续使用较新版本的 Claude Code、但又想尝试不同 `Output efficiency` 指令集而不是降级到旧版本的用户，可能会有帮助。
-
-### 提示词版本
-
-<details>
-<summary>Anthropic 内部 / <code>USER_TYPE=ant</code> 版本</summary>
-
-```text
-# Output efficiency
-
-When sending user-facing text, you're writing for a person, not logging to a console. Assume users can't see most tool calls or thinking - only your text output. Before your first tool call, briefly state what you're about to do. While working, give short updates at key moments: when you find something load-bearing (a bug, a root cause), when changing direction, when you've made progress without an update.
-
-When you give updates, assume the recipient may have stepped away and lost the thread. They do not know your internal shorthand, codenames, or half-formed plan. Write in complete, grammatical sentences that can be understood cold. Spell out technical terms when helpful. If unsure, err on the side of a bit more explanation. Adapt to the user's expertise: experts can handle denser updates, but don't make novice users reconstruct context on their own.
-
-User-facing text should read like natural prose. Avoid clipped sentence fragments, excessive dashes, symbolic shorthand, or formatting that reads like console output. Use tables only when they genuinely improve scanability, such as compact facts (files, lines, pass/fail) or quantitative comparisons. Keep explanatory reasoning in prose around the table, not inside it. Avoid semantic backtracking: structure sentences so the user can follow them linearly without having to reinterpret earlier clauses after reading later ones.
-
-Optimize for fast human comprehension, not minimal surface area. If the user has to reread your summary or ask a follow-up just to understand what happened, you saved the wrong tokens. Match the level of structure to the task: for a simple question, answer in plain prose without unnecessary headings or numbered lists. While staying clear and direct, also be concise and avoid fluff. Skip filler, obvious restatements, and throat-clearing. Get to the point. Don't over-focus on low-signal details from your process. When it helps, use an inverted pyramid structure with the conclusion first and details later.
-
-These user-facing text instructions do not apply to code or tool calls.
-```
-
-</details>
-
-<details>
-<summary>公开 / 默认 Claude Code 版本</summary>
-
-```text
-# Output efficiency
-
-IMPORTANT: Go straight to the point. Try the simplest approach first without going in circles. Do not overdo it. Be extra concise.
-
-Your text output is brief, direct, and to the point. Lead with the answer or action, not the reasoning. Omit filler, preamble, and unnecessary transitions. Do not restate the user's request; move directly to the work. When explanation is needed, include only what helps the user understand the outcome.
-
-Prioritize user-facing text for:
-- decisions that require user input
-- high-signal progress updates at natural milestones
-- errors or blockers that change the plan
-
-If a sentence can do the job, do not turn it into three. Favor short, direct constructions over long explanatory prose. These instructions do not apply to code or tool calls.
-```
-
-</details>
-
-<details>
-<summary>自定义替换示例（结合上面两版的折中版本）</summary>
-
-```text
-# Output efficiency
-
-When sending user-facing text, write for a person, not a log file. Assume the user cannot see most tool calls or hidden reasoning - only your text output.
-
-Keep user-facing text clear, direct, and reasonably concise. Lead with the answer or action. Skip filler, repetition, and unnecessary preamble.
-
-Explain enough for the user to understand the reasoning, tradeoffs, or root cause when that would help them learn or make a decision, but do not turn simple answers into long writeups.
-
-These instructions apply to user-facing text only. They do not apply to investigation, code reading, tool use, or verification.
-
-Before making changes, read the relevant code and understand the surrounding context. Check types, signatures, call sites, and error causes before editing. Do not confuse brevity with rushing, and do not replace understanding with trial and error.
-
-While working, give short updates at meaningful moments: when you find the root cause, when the plan changes, when you hit a blocker, or when a meaningful milestone is complete. Do not narrate every step.
-
-When reporting results, be accurate and concrete. If you did not verify something, say so plainly. If a check failed, say that plainly too.
-```
-
-</details>
-
-## 监控功能
-
-拦截器包含社区发现的多项额外问题的监控：
-
-### 微压缩 / 预算执行
-
-Claude Code 通过服务器控制机制（GrowthBook 标志）静默替换旧的工具结果为 `[Old tool result content cleared]`。200,000 字符的聚合上限和每工具上限（Bash: 30K, Grep: 20K）会截断较早的结果且无通知。
-
-拦截器检测已清除的工具结果并记录计数。当总工具结果字符数接近 200K 阈值时，会记录警告。
-
-### 虚假速率限制器
-
-客户端可以在不发起 API 调用的情况下生成合成的 "Rate limit reached" 错误，可通过 `"model": "<synthetic>"` 识别。拦截器会记录这些事件。
-
-### 配额追踪
-
-解析响应头中的 `anthropic-ratelimit-unified-5h-utilization` 和 `7d-utilization`，保存到 `~/.claude/quota-status.json`，供状态栏钩子或其他工具使用。
-
-### 高峰时段检测
-
-Anthropic 在工作日高峰时段（UTC 13:00-19:00，周一至周五）会提高配额消耗速率。拦截器检测高峰窗口并将 `peak_hour: true/false` 写入 `quota-status.json`。详见 `docs/peak-hours-reference.md`。
-
-### 使用量遥测与成本报告
-
-拦截器将每次调用的使用数据记录到 `~/.claude/usage.jsonl` — 每次 API 调用一行 JSON，包含模型、token 计数和缓存明细。使用内置的成本报告工具分析费用：
-
-```bash
-node tools/cost-report.mjs                    # 从拦截器日志查看今日费用
-node tools/cost-report.mjs --date 2026-04-08  # 指定日期
-node tools/cost-report.mjs --since 2h         # 最近 2 小时
-node tools/cost-report.mjs --admin-key <key>  # 与 Admin API 交叉验证
-```
-
-同样适用于任何包含 Anthropic 使用量字段的 JSONL（`--file`、stdin）— 适合 SDK 用户和代理设置。支持文本、JSON 和 Markdown 输出格式。详见 `docs/cost-report.md`。
-
-## 调试模式
-
-启用调试日志以验证修复是否生效：
-
-```bash
-CACHE_FIX_DEBUG=1 claude-fixed
-```
-
-日志写入 `~/.claude/cache-fix-debug.log`。重点关注：
-
-- `APPLIED: resume message relocation` — 块散布已检测并修复
-- `APPLIED: tool order stabilization` — 工具已重新排序
-- `APPLIED: fingerprint stabilized from XXX to YYY` — 指纹已被纠正
-- `APPLIED: stripped N images from old tool results` — 已从旧工具结果中剥离图片
-- `APPLIED: output efficiency section rewritten` — `output efficiency` 段已被替换
-- `MICROCOMPACT: N/M tool results cleared` — 检测到微压缩降级
-- `BUDGET WARNING: tool result chars at N / 200,000 threshold` — 接近预算上限
-- `FALSE RATE LIMIT: synthetic model detected` — 检测到客户端侧虚假速率限制
-- `GROWTHBOOK FLAGS: {...}` — 首次调用时记录的服务器控制标志
-- `PROMPT SIZE: system=N tools=N injected=N (skills=N mcp=N ...)` — 每次调用的提示体积明细
-- `CACHE TTL: tier=1h create=N read=N hit=N% (1h=N 5m=N)` — TTL 档位和每次调用的缓存命中率
-- `PEAK HOUR: weekday 13:00-19:00 UTC` — Anthropic 高峰时段限流生效
-- `SKIPPED: resume relocation (not a resume or already correct)` — 无需修复
-- `SKIPPED: output efficiency rewrite (section not found)` — 未找到匹配的 `output efficiency` 段
-
-### Prefix diff mode
-
-启用跨进程前缀快照差异对比，以诊断重启后的缓存失效：
-
-```bash
-CACHE_FIX_PREFIXDIFF=1 claude-fixed
-```
-
-快照会保存到 `~/.claude/cache-fix-snapshots/`，并在重启后的第一次 API 调用时生成差异报告。
-
-## 环境变量
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `CACHE_FIX_DEBUG` | `0` | 启用调试日志 |
-| `CACHE_FIX_PREFIXDIFF` | `0` | 启用前缀快照差异对比 |
-| `CACHE_FIX_IMAGE_KEEP_LAST` | `0` | 保留最近 N 条用户消息中的图片（0 = 禁用） |
-| `CACHE_FIX_OUTPUT_EFFICIENCY_REPLACEMENT` | unset | 在请求发出前替换 Claude Code 的 `# Output efficiency` 系统提示词段落 |
-| `CACHE_FIX_USAGE_LOG` | `~/.claude/usage.jsonl` | 每次调用使用量遥测日志路径 |
+完整详情、调试模式、前缀差异对比、环境变量和内置配额分析工具请参见 [docs/monitoring.md](docs/monitoring.md)。
 
 ## 限制
 
-- **仅支持 npm 安装** — 独立 Claude Code 二进制文件具有 Zig 级别的证明机制，会绕过 Node.js。本修复仅适用于 npm 包（`npm install -g @anthropic-ai/claude-code`）。
-- **超额 TTL 降级** — 超过 5 小时配额的 100% 会触发服务器端 TTL 从 1h 降级至 5m。这是服务器端决策，无法在客户端修复。拦截器通过防止缓存不稳定来避免你首先进入超额状态。
-- **微压缩不可阻止** — 监控功能可以检测上下文降级，但无法阻止。微压缩和预算执行机制是通过 GrowthBook 标志进行服务器控制的，没有客户端禁用选项。
-- **系统提示词重写是实验性的** — 此 hook 只会重写一个系统提示词段落，并且默认关闭，但仍存在未知因素：目前并未证明这段提示词文本本身就是社区报告中行为差异的根因，也无法确认未来服务端校验是否会对修改后的系统提示词作出反应。使用风险由用户自行承担。
-- **版本耦合** — 指纹 salt 和块检测启发式规则都来自 Claude Code 内部实现。重大重构可能需要更新此包。
+- **代理需要运行中的进程** — 必须在 Claude Code 之前启动代理。建议作为 systemd 服务运行或使用带健康检查的包装脚本。
+- **超额 TTL 降级** — 超过 5 小时配额的 100% 会触发服务器端 TTL 从 1h 降级至 5m。这是服务器端决策，无法在客户端修复。代理/拦截器防止可能推你进入超额状态的缓存不稳定。
+- **微压缩不可阻止** — 监控功能可以检测上下文降级但无法阻止。微压缩和预算执行是通过 GrowthBook 标志的服务器控制，没有客户端禁用选项。
+- **系统提示重写是实验性的** — 仅预加载模式，可选。未证明是社区报告中讨论的行为差异的原因。使用风险由用户自行承担。
+- **版本耦合** — 指纹 salt 和块检测启发式规则源自 Claude Code 内部实现。重大重构可能需要更新此包。
 
-## 相关问题
+## 追踪的问题
 
-- [#34629](https://github.com/anthropics/claude-code/issues/34629) — 恢复缓存回归的原始报告
-- [#40524](https://github.com/anthropics/claude-code/issues/40524) — 会话内指纹失效，图片持久化
-- [#42052](https://github.com/anthropics/claude-code/issues/42052) — 社区拦截器开发，TTL 降级发现
-- [#43044](https://github.com/anthropics/claude-code/issues/43044) — 恢复会话后在 v2.1.91 上仅加载 0% 上下文
-- [#43657](https://github.com/anthropics/claude-code/issues/43657) — 在 v2.1.92 上确认恢复会话导致缓存失效
-- [#44045](https://github.com/anthropics/claude-code/issues/44045) — SDK 层面的复现与 token 测量
-- [#32508](https://github.com/anthropics/claude-code/issues/32508) — 关于 `Output efficiency` 系统提示词变更及其可能影响模型行为的社区讨论
+我们监控 30 多个与缓存、配额和上下文 bug 相关的上游 Claude Code 问题。完整列表、我们的参与情况、社区研究和关键贡献者请参见 [TRACKED_ISSUES.md](TRACKED_ISSUES.md)。
+
+## 相关研究
+
+- **[@ArkNill/claude-code-hidden-problem-analysis](https://github.com/ArkNill/claude-code-hidden-problem-analysis)** — 38,996 请求的代理分析：7 个 bug（微压缩、预算上限、虚假速率限制器、JSONL 重复、扩展思考）、GrowthBook 功能标志因果测试、Opus 4.7 消耗率警告。v1.1.0 的监控功能基于此研究。
+- **[@Renvect/X-Ray-Claude-Code-Interceptor](https://github.com/Renvect/X-Ray-Claude-Code-Interceptor)** — 带实时仪表板的诊断 HTTPS 代理、系统提示段落差异对比、按工具的剥离阈值。支持所有使用 `ANTHROPIC_BASE_URL` 的 Claude 客户端。
+- **[@fgrosswig/claude-usage-dashboard](https://github.com/fgrosswig/claude-usage-dashboard)** — 自托管取证仪表板，SSE 实时监控、多主机聚合、缓存健康评分。与我们代理的视角互补。连接设置请参见 [docs/dashboard-integration.md](docs/dashboard-integration.md)。
 
 ## 生产环境使用
 
-- **[Crunchloop DAP](https://dap.crunchloop.ai)** — Agent SDK / DAP 开发环境。首个将本拦截器合入 trunk 并团队级部署的生产团队（2026-04-10）。通过真实环境测试发现两类不同的缓存回归问题——工具排序抖动与 fresh-session 排序漏洞，并贡献了驱动 v1.5.1 与 v1.6.2 修复的调试日志。
+- **[Crunchloop DAP](https://dap.crunchloop.ai)** — Agent SDK / DAP 开发环境。首个将拦截器合入 trunk 并团队级部署的生产团队（2026-04-10）。通过实际测试发现两类缓存回归问题 — 工具排序抖动与新会话排序缺口，并贡献了驱动 v1.5.1 和 v1.6.2 修复的调试日志。
 
 ## 贡献者
 
-- **[@VictorSun92](https://github.com/VictorSun92)** — 原始 v2.1.88 monkey-patch 修复作者，识别出 v2.1.90 中的部分块散布问题，并贡献了前向扫描检测、正确的块排序、更严格的块匹配器，以及可选的 output-efficiency 重写 hook
-- **[@bilby91](https://github.com/bilby91)** ([Crunchloop DAP](https://dap.crunchloop.ai)) — Agent SDK / DAP 生产环境验证、1h 缓存 TTL 确认、通过调试日志发现工具排序抖动（v1.5.1 修复）、通过 SKILLS SORT 诊断发现 fresh-session 排序 bug（v1.6.2 修复）。首个将本拦截器合入 trunk 的生产团队。
-- **[@jmarianski](https://github.com/jmarianski)** — 通过 MITM 代理抓包和 Ghidra 逆向分析定位根因，并提供多模式缓存测试脚本
-- **[@cnighswonger](https://github.com/cnighswonger)** — 指纹稳定化、工具顺序修复、图片剥离、监控功能、超额 TTL 降级发现，本包维护者
-- **[@ArkNill](https://github.com/ArkNill)** — 微压缩机制分析、GrowthBook 标志文档整理、虚假速率限制识别
-- **[@Renvect](https://github.com/Renvect)** — 图片重复发送问题发现、跨项目目录污染分析
+- **[@VictorSun92](https://github.com/VictorSun92)** — v2.1.88 原始 monkey-patch 修复，v2.1.90 部分散布识别，前向扫描检测、正确块排序、更严格的块匹配器及可选 output-efficiency 重写钩子
+- **[@bilby91](https://github.com/bilby91)** ([Crunchloop DAP](https://dap.crunchloop.ai)) — Agent SDK / DAP 生产环境验证，1h 缓存 TTL 确认，调试追踪发现工具排序抖动（v1.5.1 修复），SKILLS SORT 诊断发现新会话排序 bug（v1.6.2 修复）。首个将拦截器合入 trunk 的生产团队。
+- **[@jmarianski](https://github.com/jmarianski)** — 通过 MITM 代理抓包和 Ghidra 逆向分析定位根因，多模式缓存测试脚本
+- **[@cnighswonger](https://github.com/cnighswonger)** — 指纹稳定化、工具排序修复、图片剥离、监控功能、超额 TTL 降级发现、代理架构，包维护者
+- **[@ArkNill](https://github.com/ArkNill)** — 微压缩机制分析、GrowthBook 标志文档、虚假速率限制器识别、CC v2.1.108+ 指纹验证修复（PR #21）、韩文 README（PR #22）、[claude-code-hidden-problem-analysis](https://github.com/ArkNill/claude-code-hidden-problem-analysis) 研究
+- **[@Renvect](https://github.com/Renvect)** — 图片重复发现、跨项目目录污染分析
+- **[@fgrosswig](https://github.com/fgrosswig)** — [claude-usage-dashboard](https://github.com/fgrosswig/claude-usage-dashboard) 取证方法论：成本因子开销比率指标、`anthropic-*` 头部捕获模式、为仪表板互通层提供参考的代理 NDJSON 模式
+- **[@TomTheMenace](https://github.com/TomTheMenace)** — Windows `.bat` 包装器、首个 Windows 平台验证（7.5 小时/536 调用 Opus 4.6 会话，98.4% 缓存命中率）
+- **[@arjansingh](https://github.com/arjansingh)** — 动态 `npm root -g` 路径解析的 nvm 兼容包装脚本（PR #15）
+- **[@beekamai](https://github.com/beekamai)** — npm root 包含空格时的 Windows URL 编码修复（PR #17）
+- **[@JEONG-JIWOO](https://github.com/JEONG-JIWOO)** — VS Code 扩展调查：发现 `claudeCode.claudeProcessWrapper` 作为可行的集成路径，编写 Windows C 包装器（#16）
+- **[@X-15](https://github.com/X-15)** — VS Code 扩展验证、v2.1.105 安全检查行为确认的每项修复状态分析（#16）、Windows 代理管道修复（#53）、企业代理支持（PR #54）
+- **[@deafsquad](https://github.com/deafsquad)** — 通用 smoosh_split un-smoosh 修复（PR #26）、恢复散布 bug 的源码级函数归因（anthropics/claude-code#43657）、OTEL 遥测发现、v3.0.0 代理架构提议与构建
 
-如果你参与了这些问题的社区协作但尚未被列出，欢迎开 issue 或 PR，我们希望正确致谢每一位贡献者。
+如果你参与了这些问题的社区协作但尚未被列出，欢迎开 issue 或 PR — 我们希望正确致谢每一位贡献者。
+
+## 支持
+
+如果这个工具帮你省了钱，请考虑请我喝杯咖啡：
+
+<a href="https://buymeacoffee.com/vsits" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
 
 ## 许可证
 
-MIT
+[MIT](LICENSE)
