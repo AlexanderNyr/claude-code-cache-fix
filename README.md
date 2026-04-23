@@ -89,6 +89,20 @@ curl http://127.0.0.1:9801/health
 # {"status":"ok"}
 ```
 
+### Proxy configuration
+
+All proxy settings are controlled via environment variables. Set them before starting the proxy server.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CACHE_FIX_PROXY_PORT` | `9801` | Listen port |
+| `CACHE_FIX_PROXY_BIND` | `127.0.0.1` | Bind address |
+| `CACHE_FIX_PROXY_UPSTREAM` | `https://api.anthropic.com` | Upstream URL. Change to chain another proxy (e.g. `http://localhost:8080`) |
+| `CACHE_FIX_PROXY_TIMEOUT` | `600000` | Request timeout in milliseconds |
+| `CACHE_FIX_EXTENSIONS_DIR` | `proxy/extensions/` | Directory for extension `.mjs` files |
+| `CACHE_FIX_EXTENSIONS_CONFIG` | `proxy/extensions.json` | Extension configuration file |
+| `CACHE_FIX_DEBUG` | `0` | Enable debug logging |
+
 ### Corporate environments (proxies, custom CAs)
 
 The proxy honors the following environment variables when forwarding to `api.anthropic.com`. Behind Zscaler / Netskope / Forcepoint / Bluecoat / corporate squid, set these in the proxy's environment.
