@@ -50,9 +50,9 @@ function filterResponseHeaders(rawHeaders) {
 
 // --- HTTP proxy and custom CA support ---
 
-let _httpsAgent = null;
-let _httpAgent  = null;
-let _agentInitTried = false;
+const _agents = new Map();        // cache key → Agent | null
+const _loggedProxies = new Set(); // dedupe stderr "using proxy" lines per (url, isHTTPS)
+let _warnedTlsDisabled = false;
 
 function shouldBypassProxy(hostname) {
   if (!config.noProxy) return false;
@@ -81,42 +81,70 @@ function loadCa() {
   }
 }
 
-function getAgent(isHTTPS, hostname) {
-  if (!_agentInitTried) {
-    _agentInitTried = true;
+// Pick the proxy URL for an upstream, matching curl/Python/Go semantics:
+//   https upstream → HTTPS_PROXY, falling back to HTTP_PROXY if unset
+//   http  upstream → HTTP_PROXY only (HTTPS_PROXY does NOT apply to plain HTTP)
+//
+// Exported for direct unit testing — tests against the live forwardRequest path
+// can't easily reload a fresh config across cases (config is a single module
+// instance), so we expose the pure function for table-driven coverage.
+export function selectProxyUrl(isHTTPS) {
+  if (isHTTPS) return config.httpsProxy || config.httpProxy || "";
+  return config.httpProxy || "";
+}
 
-    // Print one-time warning if TLS verification is disabled
-    if (!config.rejectUnauthorized) {
-      process.stderr.write(`[upstream] WARNING: TLS verification disabled (CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=0). This is insecure!\n`);
-    }
-
-    if (config.httpProxy) {
-      const ca = loadCa();
-      const common = {
-        keepAlive: true,
-        proxy: config.httpProxy,
-        rejectUnauthorized: config.rejectUnauthorized,
-        ...(ca ? { ca } : {}),
-      };
-      _httpsAgent = new HttpsProxyAgent(common);
-      _httpAgent  = new HttpProxyAgent(common);
-      process.stderr.write(`[upstream] using proxy ${config.httpProxy} (rejectUnauthorized=${config.rejectUnauthorized}, ca=${config.caFile || "default"})\n`);
-    } else if (config.caFile || !config.rejectUnauthorized) {
-      // No HTTP proxy, but custom CA or insecure mode requested: build a plain agent.
-      const ca = loadCa();
-      _httpsAgent = new https.Agent({
+function buildAgent(isHTTPS, proxyUrl) {
+  const ca = loadCa();
+  if (proxyUrl) {
+    const opts = {
+      keepAlive: true,
+      proxy: proxyUrl,
+      rejectUnauthorized: config.rejectUnauthorized,
+      ...(ca ? { ca } : {}),
+    };
+    return isHTTPS ? new HttpsProxyAgent(opts) : new HttpProxyAgent(opts);
+  }
+  // No proxy. Only build a custom agent when CA or insecure mode warrants it;
+  // otherwise return null so Node uses its global default agent (preserves the
+  // pre-change behavior end-to-end, including connection pooling).
+  if (ca || !config.rejectUnauthorized) {
+    if (isHTTPS) {
+      return new https.Agent({
         keepAlive: true,
         rejectUnauthorized: config.rejectUnauthorized,
         ...(ca ? { ca } : {}),
       });
     }
+    return new http.Agent({ keepAlive: true });
   }
-  if (shouldBypassProxy(hostname)) {
-    return isHTTPS
-      ? new https.Agent({ keepAlive: true, rejectUnauthorized: config.rejectUnauthorized, ca: loadCa() })
-      : new http.Agent({ keepAlive: true });
+  return null;
+}
+
+function getAgent(isHTTPS, hostname) {
+  if (!_warnedTlsDisabled && !config.rejectUnauthorized) {
+    _warnedTlsDisabled = true;
+    process.stderr.write(
+      `[upstream] WARNING: TLS verification disabled (CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=0). This is insecure!\n`
+    );
   }
-  return isHTTPS ? _httpsAgent : _httpAgent;
+
+  const bypass = shouldBypassProxy(hostname);
+  const proxyUrl = bypass ? "" : selectProxyUrl(isHTTPS);
+  const cacheKey = `${isHTTPS ? "https" : "http"}|${proxyUrl}|${config.caFile}|${config.rejectUnauthorized}`;
+
+  let agent = _agents.get(cacheKey);
+  if (agent === undefined) {
+    agent = buildAgent(isHTTPS, proxyUrl);
+    _agents.set(cacheKey, agent);
+    if (proxyUrl && !_loggedProxies.has(`${proxyUrl}|${isHTTPS}`)) {
+      _loggedProxies.add(`${proxyUrl}|${isHTTPS}`);
+      process.stderr.write(
+        `[upstream] using proxy ${proxyUrl} for ${isHTTPS ? "https" : "http"} upstream ` +
+        `(rejectUnauthorized=${config.rejectUnauthorized}, ca=${config.caFile || "default"})\n`
+      );
+    }
+  }
+  return agent;
 }
 
 export function forwardRequest(clientReq, body, signal) {
