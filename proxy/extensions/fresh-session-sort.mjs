@@ -86,6 +86,8 @@ function fixBlockText(blockType, text) {
   return pinBlockContent(blockType, fixed);
 }
 
+export { isSystemReminder, isHooksBlock, isSkillsBlock, isDeferredToolsBlock, isMcpBlock, isRelocatableBlock, isClearArtifact, sortSkillsBlock, sortDeferredToolsBlock, stripSessionKnowledge, pinBlockContent, getBlockType, fixBlockText };
+
 export default {
   name: "fresh-session-sort",
   description: "Relocate scattered blocks to messages[0] in deterministic fresh-session order",

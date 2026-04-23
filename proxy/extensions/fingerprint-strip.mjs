@@ -88,6 +88,8 @@ function stabilizeFingerprint(system, messages) {
   return { attrIdx, newText, oldFingerprint, stableFingerprint };
 }
 
+export { computeFingerprint, extractRealUserMessageText, extractFirstMessageText, stabilizeFingerprint };
+
 export default {
   name: "fingerprint-strip",
   description: "Stabilize cc_version fingerprint in system prompt for cache prefix consistency",

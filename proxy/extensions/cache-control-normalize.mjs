@@ -24,6 +24,8 @@ function countUserCacheControlMarkers(body) {
   return n;
 }
 
+export { stripCacheControlMarkers, countUserCacheControlMarkers };
+
 export default {
   name: "cache-control-normalize",
   description: "Strip scattered cache_control markers from user messages and apply canonical placement",

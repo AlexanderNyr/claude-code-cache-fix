@@ -28,6 +28,8 @@ function isDeferredToolsBlock(text) {
   return typeof text === "string" && text.includes("deferred tools are now available");
 }
 
+export { sortSkillsBlock, sortDeferredToolsBlock, isSkillsBlock, isDeferredToolsBlock };
+
 export default {
   name: "sort-stabilization",
   description: "Deterministic ordering of skills, deferred tools, and tool definitions",
