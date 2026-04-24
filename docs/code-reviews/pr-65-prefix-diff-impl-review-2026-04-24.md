@@ -39,3 +39,6 @@ None.
 
 Approve for merge. The implementation is correct, non-mutating, fail-open, and well-covered on the important behavioral paths. The only material mismatch I found is between the written directive and the loader realities around `enabled`; that is a spec/documentation consistency issue, not an implementation blocker.
 
+## Follow-up verified
+
+2026-04-24: Verified commit `d480ef0` addressed the three nits and two nice-to-haves from this review. Confirmed the orphan `.tmp` comment and named-export test-seam note in [proxy/extensions/prefix-diff.mjs](/home/manager/git_repos/claude-code-cache-fix/proxy/extensions/prefix-diff.mjs), the deterministic debug-log and stronger concurrency assertions in [test/proxy-prefix-diff.test.mjs](/home/manager/git_repos/claude-code-cache-fix/test/proxy-prefix-diff.test.mjs), and the `enabled: true` directive reconciliation in [docs/directives/proxy-prefix-diff.md](/home/manager/git_repos/claude-code-cache-fix/docs/directives/proxy-prefix-diff.md). Targeted test file passes locally.
