@@ -23,15 +23,38 @@ The preload version uses `process.cwd()` as the snapshot key. **This does not tr
 - In preload, `process.cwd()` is the Claude Code process's CWD — different per CC session per project.
 - In the proxy, `process.cwd()` is the long-lived proxy daemon's CWD — **shared across all CC sessions on the host**. Two unrelated projects would collide onto the same snapshot file.
 
-The proxy version derives the snapshot key from the **system prompt content**, not the proxy's CWD:
+A previous revision proposed `sha1(JSON.stringify(payload.system).slice(0, 2000))` as the key. **This is also unsafe** for two competing reasons:
 
-```
-key = sha1(JSON.stringify(payload.system).slice(0, 2000)).slice(0, 16)
-```
+- The first ~500 chars of CC's system prompt are stable across sessions but **identical across all projects** (it's the role boilerplate). Hashing only the leading region produces project-blind keys.
+- Going deeper into the slice catches project-distinguishing content (cwd line, CLAUDE.md, skills) but also catches volatile content (git status text, hook output) that drifts between sessions for the same project.
 
-Same project (same CC project root, same CLAUDE.md, same skills) → same system prompt → same key. Different projects → different system prompts → different keys. This matches the keying scheme that `prefix-diff` (PR #65) uses, with the same rationale.
+Either failure mode breaks restore reliability or causes cross-project contamination.
 
-If `payload.system` is absent or empty, the extension no-ops (no key → no snapshot work). This is correct behavior: a request with no system prompt has no project identity for the proxy to key on.
+### The proxy version parses the cwd directly from the system prompt
+
+CC injects the working directory into the system prompt content as a deterministic marker (e.g., a line like `Working directory: /path/to/project` or an `<env>` block — exact format to be confirmed empirically during implementation against current CC versions). The proxy:
+
+1. Walks `payload.system` text content looking for the cwd marker.
+2. If found → key = `sha1("cwd:" + extractedPath).slice(0, 16)`. Stable across CC restarts for same project. Unique per project.
+3. If not found → **no-op for this request** (no persist, no restore). Better to do nothing than to fall back to an unsafe heuristic.
+
+This honest no-op is a correctness property: when the proxy can't reliably identify the project, the deferred-tools-restore behavior degrades to the status quo (cache may bust on the next resume), which is identical to the user not having the extension at all. The system never silently corrupts state by restoring the wrong block.
+
+### Why this passes the previous Codex blocker
+
+- `cwd:` derivation is invariant under file edits, hook firings, and git-status changes — none of those rewrite the cwd line.
+- Cross-project collision requires two projects with the same cwd string, which is impossible by definition.
+- If CC changes its system-prompt format and the marker disappears, the no-op fallback prevents incorrect restores. The implementation should log a debug warning when the marker is missing for >N consecutive requests so we notice format drift.
+
+### Marker-format research (to do during implementation)
+
+Before locking the parser, the implementation must:
+- Capture a real CC v2.1.117+ system prompt via `proxy/extensions/request-log.mjs` (or a dedicated short-lived debug extension)
+- Identify the actual cwd marker format (line prefix, surrounding tags, position in the content)
+- Build a regex that matches the current format and document a fallback if CC introduces multiple variants
+- Add a test fixture using the real captured prompt shape (sanitized of any user paths)
+
+If the empirical inspection shows the cwd is NOT reliably present in the system prompt, escalate before shipping — at that point the choice is option (B): drop the extension and document why deferred-tools-restore is preload-only.
 
 ## Reference (preload behavior to mirror)
 
@@ -39,18 +62,19 @@ If `payload.system` is absent or empty, the extension no-ops (no key → no snap
 - `preload.mjs` lines ~2286–2322 (integration block — persist-or-restore decision)
 - Env var: `CACHE_FIX_SKIP_DEFERRED_TOOLS_RESTORE=1` to opt out (extension defaults **ON**)
 - Snapshot dir: `~/.claude/cache-fix-state/`
-- Snapshot file: `deferred-tools-<key>.txt` where `<key>` is the system-hash described above
+- Snapshot file: `deferred-tools-<key>.txt` where `<key>` is `sha1("cwd:" + extractedCwd).slice(0, 16)`
 - Markers (unchanged from preload):
   - AVAILABLE: `"The following deferred tools are now available via ToolSearch"`
   - UNAVAILABLE: `"The following deferred tools are no longer available"`
 
 ### Algorithm
 
-1. Compute snapshot key from `payload.system`. If empty/absent → no-op.
-2. Walk `body.messages` to locate the deferred-tools block — only `role: "user"` messages, only `type: "text"` blocks containing the AVAILABLE marker. Return `{ msgIdx, blockIdx, text }` or `null`. (Skip assistant messages so the agent quoting the marker doesn't trigger a false match.)
-3. If no block found → no-op.
-4. If block exists and does **not** contain the UNAVAILABLE marker → it's a clean baseline. Persist it (best-effort, atomic write — see below).
-5. If block exists and **does** contain the UNAVAILABLE marker → attempt restore:
+1. Parse cwd from `payload.system`. If `payload.system` is absent, empty, or no cwd marker is found → **no-op for this request** (skip both persist and restore).
+2. Compute snapshot key: `sha1("cwd:" + extractedCwd).slice(0, 16)`.
+3. Walk `body.messages` to locate the deferred-tools block — only `role: "user"` messages, only `type: "text"` blocks containing the AVAILABLE marker. Return `{ msgIdx, blockIdx, text }` or `null`. (Skip assistant messages so the agent quoting the marker doesn't trigger a false match.)
+4. If no block found → no-op.
+5. If block exists and does **not** contain the UNAVAILABLE marker → it's a clean baseline. Persist it (best-effort, atomic write — see below).
+6. If block exists and **does** contain the UNAVAILABLE marker → attempt restore:
    - Read snapshot file. If unreadable, malformed, or shorter than a sane minimum (e.g., < length of `AVAILABLE` marker) → skip restore (treat as no snapshot).
    - **Only substitute if the snapshot is strictly longer than the current block.** Never downgrade.
    - Substitute by replacing `messages[msgIdx].content[blockIdx].text` with the snapshotted bytes.
@@ -91,7 +115,8 @@ The restored block may reference MCP tools that haven't actually reconnected yet
 
 Match the prefix-diff revision: **do not** introduce `CACHE_FIX_DEFERRED_TOOLS_DIR` as a runtime env var. Instead, export the underlying pure functions alongside `default`:
 
-- `deriveSnapshotKey(systemPrompt)` — returns the sha1 hash key, exposed for tests
+- `extractCwdFromSystem(systemPrompt)` — returns the cwd string or `null` if no marker found, exposed for tests
+- `deriveSnapshotKey(cwd)` — returns `sha1("cwd:" + cwd).slice(0, 16)`, exposed for tests
 - `findDeferredToolsBlockInBody(body)` — returns `{ msgIdx, blockIdx, text } | null`
 - `persistDeferredTools(text, options)` — atomic write to `options.dir`
 - `restoreDeferredTools(options)` — read + validate; returns `string | null`
@@ -118,24 +143,28 @@ Set `ctx.meta.deferredToolsRestoreStats = { action: "persisted"|"restored"|"skip
 
 1. No-op when `CACHE_FIX_SKIP_DEFERRED_TOOLS_RESTORE=1`
 2. No-op when no deferred-tools block exists in `body.messages`
-3. No-op when `payload.system` is absent (no key)
-4. Persists snapshot when block is clean (no UNAVAILABLE marker)
-5. `deriveSnapshotKey` is deterministic for identical system prompts and differs for distinct system prompts
-6. Restores from snapshot when current block has UNAVAILABLE marker AND snapshot is longer
-7. **Downgrade guard — exhaustive boundary tests:**
-   - Snapshot exactly 1 byte shorter than current → skip restore
-   - Snapshot many bytes shorter than current → skip restore
-   - Snapshot exactly equal length to current → skip restore (must be **strictly** longer)
-   - Snapshot 1 byte longer → restore
-8. Skips restore when no snapshot file exists
-9. Skips assistant messages (block in assistant content does not trigger detection)
-10. Locates block at `messages[N].content[M]` for arbitrary N, M (not just `[0][0]`)
-11. **Atomic write under failure:** simulate `rename` throwing after `.tmp` write succeeds; assert the prior snapshot file is intact and unchanged
-12. **Truncated snapshot rejection:** write a snapshot file shorter than `AVAILABLE_MARKER.length`; next call must skip restore (never substitute a truncated value)
-13. **Missing-marker rejection:** write a same-length snapshot that doesn't contain the AVAILABLE marker; next call must skip restore
-14. **Concurrent invocations:** fire two `default.onRequest` calls in parallel against the same key; assert no throw, snapshot file is one of the two valid versions (not partial), and at least one call's stats reflect the persistence
-15. Snapshot read failure (point dir at unreadable path) does not throw; debug-logs when `CACHE_FIX_DEBUG=1`
-16. Snapshot write failure (point dir at `/dev/null/nope`) does not throw; debug-logs when `CACHE_FIX_DEBUG=1`
+3. No-op when `payload.system` is absent
+4. **No-op when cwd marker is not present in `payload.system`** (assert that no file is written and no restore is attempted; assert that `ctx.body` is unchanged)
+5. `extractCwdFromSystem` returns the path when the marker is present in any block of the system array; returns `null` otherwise
+6. `extractCwdFromSystem` is robust against the marker appearing inside a code-fenced or quoted region of an unrelated block (the implementation should look in expected positions, not just any text containing the marker substring)
+7. `deriveSnapshotKey("/foo")` is deterministic across calls; `deriveSnapshotKey("/foo")` ≠ `deriveSnapshotKey("/bar")`
+8. Persists snapshot when block is clean (no UNAVAILABLE marker) AND cwd is parseable
+9. Restores from snapshot when current block has UNAVAILABLE marker AND snapshot is longer AND cwd is parseable
+10. **Downgrade guard — exhaustive boundary tests:**
+    - Snapshot exactly 1 byte shorter than current → skip restore
+    - Snapshot many bytes shorter than current → skip restore
+    - Snapshot exactly equal length to current → skip restore (must be **strictly** longer)
+    - Snapshot 1 byte longer → restore
+11. Skips restore when no snapshot file exists
+12. Skips assistant messages (block in assistant content does not trigger detection)
+13. Locates block at `messages[N].content[M]` for arbitrary N, M (not just `[0][0]`)
+14. **Atomic write under failure:** simulate `rename` throwing after `.tmp` write succeeds; assert the prior snapshot file is intact and unchanged
+15. **Atomic write — temp-write failure:** simulate `writeFile` throwing on the `.tmp` path; assert no `.tmp` orphan, no rename attempted, prior snapshot intact
+16. **Truncated snapshot rejection:** write a snapshot file shorter than `AVAILABLE_MARKER.length`; next call must skip restore (never substitute a truncated value)
+17. **Missing-marker rejection:** write a same-length snapshot that doesn't contain the AVAILABLE marker; next call must skip restore
+18. **Concurrent invocations:** fire two `default.onRequest` calls in parallel against the same key; assert no throw, snapshot file is one of the two valid versions (not partial), and at least one call's stats reflect the persistence
+19. Snapshot read failure (point dir at unreadable path) does not throw; debug-logs when `CACHE_FIX_DEBUG=1`
+20. Snapshot write failure (point dir at `/dev/null/nope`) does not throw; debug-logs when `CACHE_FIX_DEBUG=1`
 
 ## README update (handles #59 item 10)
 
@@ -153,10 +182,11 @@ Closing-out comment on #59 should reference this README addition.
 
 ## Acceptance
 
-- All 16 new tests pass; full proxy test suite green
+- All 20 new tests pass; full proxy test suite green
+- The cwd-marker format is verified empirically against current CC v2.1.117+ system prompts (capture via request-log; document the actual marker shape in a code comment)
 - README has the "why we don't ship" note in the git-status section, phrased as technical impossibility (not preference)
 - `claude --continue` against a project with MCP delay shows `[deferred-tools-restore] restored ...` in proxy stderr and a corresponding cache-creation drop
-- Codex re-review with no blockers
+- Codex implementation-stage review with no blockers
 - PR description closes #59 (`Closes #59`)
 
 ## #59 close-out comment (for the merger to post when merging)
