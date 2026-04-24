@@ -146,7 +146,7 @@ test("extractCwdFromSystem: narrative mention of working directory does NOT matc
   assert.equal(extractCwdFromSystem(sys), null);
 });
 
-test("extractCwdFromSystem: scans across blocks; first match wins", () => {
+test("extractCwdFromSystem: scans across blocks; only the # Environment-anchored match wins", () => {
   const sys = [
     { type: "text", text: "no marker here" },
     {
@@ -157,11 +157,69 @@ test("extractCwdFromSystem: scans across blocks; first match wins", () => {
         "more content",
     },
     {
+      // No # Environment header in this block, so the marker is ignored
+      // even though it's syntactically valid.
       type: "text",
       text: " - Primary working directory: /should/not/win\n",
     },
   ];
   assert.equal(extractCwdFromSystem(sys), "/first/match");
+});
+
+test("extractCwdFromSystem: rejects code-fenced fake marker without # Environment header", () => {
+  // A block that LOOKS like it has the marker but lacks the # Environment
+  // header — typical of an example or quoted region elsewhere in the prompt.
+  const sys = [
+    {
+      type: "text",
+      text:
+        "Example output:\n" +
+        "```\n" +
+        " - Primary working directory: /WRONG/path/from/example\n" +
+        "```\n",
+    },
+  ];
+  assert.equal(extractCwdFromSystem(sys), null);
+});
+
+test("extractCwdFromSystem: prefers real # Environment marker over earlier fake in fence", () => {
+  // Block A has a code-fenced fake marker (no env header).
+  // Block B has the real # Environment section.
+  // Real value must win regardless of block order.
+  const fakeBlock = {
+    type: "text",
+    text:
+      "Tutorial section:\n" +
+      "```\n" +
+      " - Primary working directory: /tutorial/example\n" +
+      "```\n",
+  };
+  const realBlock = {
+    type: "text",
+    text:
+      "# Environment\n" +
+      " - Primary working directory: /actual/cwd\n" +
+      " - Platform: linux\n",
+  };
+  assert.equal(extractCwdFromSystem([fakeBlock, realBlock]), "/actual/cwd");
+  // And in the reverse order — the loop finds the real one in block 0.
+  assert.equal(extractCwdFromSystem([realBlock, fakeBlock]), "/actual/cwd");
+});
+
+test("extractCwdFromSystem: ignores marker that appears BEFORE the # Environment header in same block", () => {
+  // Pathological case: same block contains a fake marker before the env
+  // header. Our window starts at the env header, so the fake is ignored.
+  const sys = [
+    {
+      type: "text",
+      text:
+        " - Primary working directory: /pre-env/fake\n" +
+        "...much later in the block...\n" +
+        "# Environment\n" +
+        " - Primary working directory: /actual/cwd\n",
+    },
+  ];
+  assert.equal(extractCwdFromSystem(sys), "/actual/cwd");
 });
 
 // --- deriveSnapshotKey ---
@@ -276,6 +334,26 @@ test("restoreDeferredTools: rejects same-length snapshot missing AVAILABLE marke
     const path = join(dir, `deferred-tools-${key}.txt`);
     // Make a snapshot LONGER than AVAILABLE_MARKER but missing the marker text
     await writeFile(path, "x".repeat(AVAILABLE_MARKER.length + 100));
+    const restored = await restoreDeferredTools({ dir, key });
+    assert.equal(restored, null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("restoreDeferredTools: rejects snapshot containing UNAVAILABLE marker (defense-in-depth)", async () => {
+  // Persisted snapshots should never contain UNAVAILABLE by construction
+  // (we only persist when !hasUnavail), but if one ever does, refuse to
+  // restore. Restoring a "no longer available" block would be worse than
+  // not restoring at all.
+  const dir = await newTmp();
+  try {
+    const key = "hasunavail123456";
+    const path = join(dir, `deferred-tools-${key}.txt`);
+    await writeFile(
+      path,
+      `${AVAILABLE_MARKER}: tool1, tool2\n${UNAVAILABLE_MARKER} (their MCP server disconnected)`,
+    );
     const restored = await restoreDeferredTools({ dir, key });
     assert.equal(restored, null);
   } finally {

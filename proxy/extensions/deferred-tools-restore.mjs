@@ -72,11 +72,24 @@ function debug(msg) {
  * Extract the working-directory path from CC's system prompt.
  * Returns the parsed path string, or null if the marker is not found.
  *
+ * SECTION-AWARE: Only matches the marker within CC's actual # Environment
+ * section. A bare regex over all text blocks would accept a code-fenced
+ * fake marker (e.g. an example in another block) ahead of the real one
+ * and derive the wrong key — exactly the false-positive Codex flagged on
+ * the first implementation review.
+ *
+ * Algorithm: find the `# Environment` header in any text block, then look
+ * for the marker line within a small window after it (the env section is
+ * <1KB in practice; window cap is generous defense). If no `# Environment`
+ * header → null (fail-open: extension no-ops the request).
+ *
  * Accepts:
- *   - array of content blocks (CC's normal shape): walks .text fields
+ *   - array of content blocks (CC's normal shape): walks .text fields in order
  *   - a single string (rare; older clients): scans directly
  *   - anything else: returns null
  */
+const ENV_SECTION_WINDOW = 1500;
+
 function extractCwdFromSystem(system) {
   if (!system) return null;
   const texts = [];
@@ -92,7 +105,10 @@ function extractCwdFromSystem(system) {
     return null;
   }
   for (const t of texts) {
-    const m = t.match(CWD_MARKER_RE);
+    const envIdx = t.indexOf("# Environment");
+    if (envIdx === -1) continue;
+    const window = t.slice(envIdx, envIdx + ENV_SECTION_WINDOW);
+    const m = window.match(CWD_MARKER_RE);
     if (m && m[1]) return m[1];
   }
   return null;
@@ -192,6 +208,14 @@ async function restoreDeferredTools(options) {
   }
   if (!snapshot.includes(AVAILABLE_MARKER)) {
     debug(`snapshot rejected (missing AVAILABLE marker) at ${path}`);
+    return null;
+  }
+  // Defense in depth: persisted snapshots should be clean by construction
+  // (we only persist when !hasUnavail), but if a snapshot ever contains the
+  // UNAVAILABLE marker we refuse to restore it — restoring a "no longer
+  // available" block would be worse than no restore.
+  if (snapshot.includes(UNAVAILABLE_MARKER)) {
+    debug(`snapshot rejected (contains UNAVAILABLE marker, not a clean baseline) at ${path}`);
     return null;
   }
   return snapshot;
