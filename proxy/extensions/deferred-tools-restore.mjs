@@ -48,11 +48,6 @@ const AVAILABLE_MARKER =
 const UNAVAILABLE_MARKER =
   "The following deferred tools are no longer available";
 
-// Empirically verified against CC v2.1.117+. The marker line lives in the
-// stable # Environment section, before the volatile gitStatus content.
-const CWD_MARKER_RE =
-  /^\s*-\s+Primary working directory:\s*(.+?)\s*$/m;
-
 const DEFAULT_FS = {
   mkdir: _mkdir,
   readFile: _readFile,
@@ -70,25 +65,66 @@ function debug(msg) {
 
 /**
  * Extract the working-directory path from CC's system prompt.
- * Returns the parsed path string, or null if the marker is not found.
+ * Returns the parsed path string, or null if the marker is not found OR
+ * the prompt structure is ambiguous (multiple valid env sections).
  *
- * SECTION-AWARE: Only matches the marker within CC's actual # Environment
- * section. A bare regex over all text blocks would accept a code-fenced
- * fake marker (e.g. an example in another block) ahead of the real one
- * and derive the wrong key — exactly the false-positive Codex flagged on
- * the first implementation review.
+ * STRICT STRUCTURAL PARSER (line-based, not regex-window):
  *
- * Algorithm: find the `# Environment` header in any text block, then look
- * for the marker line within a small window after it (the env section is
- * <1KB in practice; window cap is generous defense). If no `# Environment`
- * header → null (fail-open: extension no-ops the request).
+ * Recognizes a valid # Environment section ONLY when ALL of these hold:
+ *   1. A line that is exactly `# Environment` (whitespace-trimmed)
+ *   2. The next non-blank line is exactly the CC intro line:
+ *      `You have been invoked in the following environment:`
+ *   3. The marker appears in a bullet line (`- Primary working directory: ...`)
+ *      within the bullet list immediately following the intro line — bounded
+ *      by the first blank line or first non-bullet line.
+ *
+ * Only the conjunction of all three rejects the false positives Codex flagged:
+ *   - bare `# Environment` mention in narrative/code (fails rule 2)
+ *   - code-fenced `Primary working directory:` example without the env header
+ *     (fails rule 1)
+ *   - a fake marker line elsewhere in the same block but not in a bullet
+ *     list immediately following the intro (fails rule 3)
+ *
+ * AMBIGUITY GUARD: if MULTIPLE distinct valid env sections produce different
+ * cwd values (across blocks or within one block), refuse to pick — return
+ * null. The fail-open path (extension no-ops the request) is strictly safer
+ * than restoring with the wrong snapshot key.
  *
  * Accepts:
  *   - array of content blocks (CC's normal shape): walks .text fields in order
  *   - a single string (rare; older clients): scans directly
  *   - anything else: returns null
  */
-const ENV_SECTION_WINDOW = 1500;
+const ENV_HEADER_LINE = "# Environment";
+const ENV_INTRO_LINE = "You have been invoked in the following environment:";
+const CWD_BULLET_RE = /^-\s+Primary working directory:\s*(.+?)\s*$/;
+
+function parseAllCwdsFromBlock(text) {
+  const found = [];
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() !== ENV_HEADER_LINE) continue;
+    // Skip blank lines after the header (CC emits exactly one intro line
+    // immediately following, but be tolerant of whitespace).
+    let j = i + 1;
+    while (j < lines.length && lines[j].trim() === "") j++;
+    if (j >= lines.length) continue;
+    if (lines[j].trim() !== ENV_INTRO_LINE) continue;
+    // Walk the bullet list following the intro line; first cwd bullet wins
+    // for this section. A blank line or non-bullet line ends the section.
+    for (let k = j + 1; k < lines.length; k++) {
+      const trimmed = lines[k].trimStart();
+      if (lines[k].trim() === "") break;
+      if (!trimmed.startsWith("-")) break;
+      const m = trimmed.match(CWD_BULLET_RE);
+      if (m && m[1]) {
+        found.push(m[1]);
+        break;
+      }
+    }
+  }
+  return found;
+}
 
 function extractCwdFromSystem(system) {
   if (!system) return null;
@@ -104,13 +140,15 @@ function extractCwdFromSystem(system) {
   } else {
     return null;
   }
+  const seen = new Set();
   for (const t of texts) {
-    const envIdx = t.indexOf("# Environment");
-    if (envIdx === -1) continue;
-    const window = t.slice(envIdx, envIdx + ENV_SECTION_WINDOW);
-    const m = window.match(CWD_MARKER_RE);
-    if (m && m[1]) return m[1];
+    const matches = parseAllCwdsFromBlock(t);
+    for (const m of matches) {
+      seen.add(m);
+      if (seen.size > 1) return null; // ambiguous → no-op
+    }
   }
+  if (seen.size === 1) return [...seen][0];
   return null;
 }
 
@@ -229,7 +267,6 @@ export {
   restoreDeferredTools,
   AVAILABLE_MARKER,
   UNAVAILABLE_MARKER,
-  CWD_MARKER_RE,
 };
 
 export default {

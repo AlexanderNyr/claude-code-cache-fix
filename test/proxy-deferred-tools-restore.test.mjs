@@ -37,7 +37,7 @@ function makeSystem(cwd, { extra = "" } = {}) {
         "another line\n" +
         "\n" +
         "# Environment\n" +
-        "You have been invoked in the following environment: \n" +
+        "You have been invoked in the following environment:\n" +
         ` - Primary working directory: ${cwd}\n` +
         "  - Is a git repository: true\n" +
         " - Platform: linux\n" +
@@ -119,6 +119,7 @@ test("extractCwdFromSystem: parses cwd from CC's # Environment block", () => {
 test("extractCwdFromSystem: also accepts string system prompt", () => {
   const text =
     "# Environment\n" +
+    "You have been invoked in the following environment:\n" +
     " - Primary working directory: /var/projects/foo\n" +
     " - Platform: linux\n";
   assert.equal(extractCwdFromSystem(text), "/var/projects/foo");
@@ -146,19 +147,20 @@ test("extractCwdFromSystem: narrative mention of working directory does NOT matc
   assert.equal(extractCwdFromSystem(sys), null);
 });
 
-test("extractCwdFromSystem: scans across blocks; only the # Environment-anchored match wins", () => {
+test("extractCwdFromSystem: only the structurally-valid section yields a match", () => {
   const sys = [
     { type: "text", text: "no marker here" },
     {
       type: "text",
       text:
         "# Environment\n" +
+        "You have been invoked in the following environment:\n" +
         " - Primary working directory: /first/match\n" +
         "more content",
     },
     {
-      // No # Environment header in this block, so the marker is ignored
-      // even though it's syntactically valid.
+      // No # Environment header + intro line in this block, so the marker
+      // line is ignored even though it's syntactically valid in isolation.
       type: "text",
       text: " - Primary working directory: /should/not/win\n",
     },
@@ -167,8 +169,6 @@ test("extractCwdFromSystem: scans across blocks; only the # Environment-anchored
 });
 
 test("extractCwdFromSystem: rejects code-fenced fake marker without # Environment header", () => {
-  // A block that LOOKS like it has the marker but lacks the # Environment
-  // header — typical of an example or quoted region elsewhere in the prompt.
   const sys = [
     {
       type: "text",
@@ -182,10 +182,22 @@ test("extractCwdFromSystem: rejects code-fenced fake marker without # Environmen
   assert.equal(extractCwdFromSystem(sys), null);
 });
 
+test("extractCwdFromSystem: rejects bare # Environment header without the intro line", () => {
+  // A user note or other section that happens to be titled # Environment
+  // but doesn't carry the CC intro line is NOT an env section.
+  const sys = [
+    {
+      type: "text",
+      text:
+        "# Environment\n" +
+        "(this is a user note about environment variables)\n" +
+        " - Primary working directory: /not/the/real/marker\n",
+    },
+  ];
+  assert.equal(extractCwdFromSystem(sys), null);
+});
+
 test("extractCwdFromSystem: prefers real # Environment marker over earlier fake in fence", () => {
-  // Block A has a code-fenced fake marker (no env header).
-  // Block B has the real # Environment section.
-  // Real value must win regardless of block order.
   const fakeBlock = {
     type: "text",
     text:
@@ -198,17 +210,15 @@ test("extractCwdFromSystem: prefers real # Environment marker over earlier fake 
     type: "text",
     text:
       "# Environment\n" +
+      "You have been invoked in the following environment:\n" +
       " - Primary working directory: /actual/cwd\n" +
       " - Platform: linux\n",
   };
   assert.equal(extractCwdFromSystem([fakeBlock, realBlock]), "/actual/cwd");
-  // And in the reverse order — the loop finds the real one in block 0.
   assert.equal(extractCwdFromSystem([realBlock, fakeBlock]), "/actual/cwd");
 });
 
 test("extractCwdFromSystem: ignores marker that appears BEFORE the # Environment header in same block", () => {
-  // Pathological case: same block contains a fake marker before the env
-  // header. Our window starts at the env header, so the fake is ignored.
   const sys = [
     {
       type: "text",
@@ -216,10 +226,75 @@ test("extractCwdFromSystem: ignores marker that appears BEFORE the # Environment
         " - Primary working directory: /pre-env/fake\n" +
         "...much later in the block...\n" +
         "# Environment\n" +
+        "You have been invoked in the following environment:\n" +
         " - Primary working directory: /actual/cwd\n",
     },
   ];
   assert.equal(extractCwdFromSystem(sys), "/actual/cwd");
+});
+
+test("extractCwdFromSystem: returns null when MULTIPLE structurally-valid env sections disagree", () => {
+  // Two valid env sections in the same block (e.g. one inside a code fence
+  // showing a full example, one real). Refusing to pick is the safe move.
+  const sys = [
+    {
+      type: "text",
+      text:
+        "# Environment\n" +
+        "You have been invoked in the following environment:\n" +
+        " - Primary working directory: /first\n" +
+        " - Platform: linux\n" +
+        "\n" +
+        "Some narrative...\n" +
+        "\n" +
+        "# Environment\n" +
+        "You have been invoked in the following environment:\n" +
+        " - Primary working directory: /second\n" +
+        " - Platform: linux\n",
+    },
+  ];
+  assert.equal(extractCwdFromSystem(sys), null);
+});
+
+test("extractCwdFromSystem: returns null when valid env sections in different blocks disagree", () => {
+  const sys = [
+    {
+      type: "text",
+      text:
+        "# Environment\n" +
+        "You have been invoked in the following environment:\n" +
+        " - Primary working directory: /block-A\n",
+    },
+    {
+      type: "text",
+      text:
+        "# Environment\n" +
+        "You have been invoked in the following environment:\n" +
+        " - Primary working directory: /block-B\n",
+    },
+  ];
+  assert.equal(extractCwdFromSystem(sys), null);
+});
+
+test("extractCwdFromSystem: identical cwds across multiple valid sections still resolve", () => {
+  // If multiple env sections exist but all agree, that's not ambiguous.
+  const sys = [
+    {
+      type: "text",
+      text:
+        "# Environment\n" +
+        "You have been invoked in the following environment:\n" +
+        " - Primary working directory: /same\n",
+    },
+    {
+      type: "text",
+      text:
+        "# Environment\n" +
+        "You have been invoked in the following environment:\n" +
+        " - Primary working directory: /same\n",
+    },
+  ];
+  assert.equal(extractCwdFromSystem(sys), "/same");
 });
 
 // --- deriveSnapshotKey ---
