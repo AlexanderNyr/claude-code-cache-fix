@@ -6,6 +6,9 @@ const BOOKKEEPING_PATTERNS = [
   /^Output tokens — turn: [^\n]+ · session: [^\n]+\s*$/,
   /^USD budget: \$[\d.]+\/\$[\d.]+; \$[\d.]+ remaining\s*$/,
   /^The task tools haven't been used recently\./,
+  /^The TodoWrite tool hasn't been used recently\./,
+  /^Remaining conversation turns: /,
+  /^Messages? until auto-compact: /,
 ];
 
 function isContinueTrailerBlock(block) {
@@ -37,20 +40,25 @@ function stripContentBlocks(messages) {
   const result = messages.map((msg) => {
     if (msg.role !== "user" || !Array.isArray(msg.content)) return msg;
 
+    let msgTrailers = 0;
+    let msgReminders = 0;
+
     const kept = msg.content.filter((block) => {
       if (isContinueTrailerBlock(block)) {
-        trailerCount++;
+        msgTrailers++;
         return false;
       }
       if (block.type === "text" && isBookkeepingReminder(block.text)) {
-        reminderCount++;
+        msgReminders++;
         return false;
       }
       return true;
     });
 
-    if (kept.length === 0) return msg;
-    if (kept.length === msg.content.length) return msg;
+    if (kept.length === 0 || kept.length === msg.content.length) return msg;
+
+    trailerCount += msgTrailers;
+    reminderCount += msgReminders;
     return { ...msg, content: kept };
   });
 

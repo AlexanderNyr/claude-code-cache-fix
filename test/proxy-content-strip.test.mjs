@@ -43,6 +43,18 @@ test("isBookkeepingReminder: task tools reminder", () => {
   assert.ok(isBookkeepingReminder("<system-reminder>\nThe task tools haven't been used recently.\n</system-reminder>"));
 });
 
+test("isBookkeepingReminder: TodoWrite reminder", () => {
+  assert.ok(isBookkeepingReminder("<system-reminder>\nThe TodoWrite tool hasn't been used recently.\n</system-reminder>"));
+});
+
+test("isBookkeepingReminder: remaining turns", () => {
+  assert.ok(isBookkeepingReminder("<system-reminder>\nRemaining conversation turns: 42\n</system-reminder>"));
+});
+
+test("isBookkeepingReminder: messages until auto-compact", () => {
+  assert.ok(isBookkeepingReminder("<system-reminder>\nMessages until auto-compact: 5\n</system-reminder>"));
+});
+
 test("isBookkeepingReminder: rejects non-bookkeeping", () => {
   assert.ok(!isBookkeepingReminder("<system-reminder>\nImportant project context.\n</system-reminder>"));
 });
@@ -84,15 +96,16 @@ test("stripContentBlocks: strips reminders", () => {
   assert.equal(result[0].content.length, 1);
 });
 
-test("stripContentBlocks: does not empty message content", () => {
+test("stripContentBlocks: does not empty message content and does not count", () => {
   const messages = [
     {
       role: "user",
       content: [{ type: "text", text: "Continue from where you left off." }],
     },
   ];
-  const { messages: result } = stripContentBlocks(messages);
+  const { messages: result, stats } = stripContentBlocks(messages);
   assert.equal(result[0].content.length, 1, "should preserve when stripping would empty");
+  assert.equal(stats, null, "should not report stats when nothing was actually stripped");
 });
 
 test("stripContentBlocks: no-op on assistant messages", () => {
