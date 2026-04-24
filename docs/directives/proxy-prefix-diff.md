@@ -68,7 +68,7 @@ Trade-off: more disk writes, but the writes are tiny (one small JSON per call wh
 - File: `proxy/extensions/prefix-diff.mjs`
 - `name`: `"prefix-diff"`
 - `description`: `"Snapshot prefix (first 5 msgs + system + tools) and diff against previous run for cache-bust hunting"`
-- `enabled`: `false` (opt-in via `CACHE_FIX_PREFIXDIFF=1`)
+- `enabled`: `true` (module default). The extension is cheap to load but does nothing unless `CACHE_FIX_PREFIXDIFF=1` is set — the env var is the only user-facing gate. (Original draft specified `enabled: false`, but that would require a second opt-in via `extensions.json`; the acceptance criterion — env var alone activates — is cleaner and matches how `image-strip` / `usage-log` similarly gate at runtime.)
 - `order`: `680` (sits between `usage-log` at 650 and `request-log` at 700 — observability, not request mutation)
 - Hook: `onRequest(ctx)` — read `ctx.body`, compute snapshot/diff, write to disk, never mutate `ctx.body`
 

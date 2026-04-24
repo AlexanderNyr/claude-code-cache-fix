@@ -146,10 +146,11 @@ function diffHasChanges(diff) {
 // parallel callers writing to the same finalPath would otherwise share
 // a single .tmp and corrupt each other's content.
 //
-// On rename failure the prior final-path file (if any) remains intact,
-// and the orphan .tmp is left for the next call to clean up implicitly
-// by overwriting (cleanup is best-effort; we don't unlink on failure
-// because that hides the original error).
+// On rename failure the prior final-path file (if any) remains intact.
+// The orphan .tmp persists on disk — because each invocation uses a
+// unique temp name, later calls do NOT implicitly overwrite it. This is
+// a small leak (accepted: failures are rare, files are tiny) rather than
+// a correctness issue. A follow-up could add best-effort cleanup.
 async function atomicWriteJson(finalPath, obj, fs) {
   const tmpPath = `${finalPath}.${process.pid}.${Date.now()}.${Math.random()
     .toString(36)
@@ -239,6 +240,11 @@ async function snapshotPrefix(payload, options = {}) {
   return { key: sessionKey, wroteSnapshot, wroteDiff };
 }
 
+// The named exports below are internal test seams, not part of the
+// proxy extension contract. Pipeline loading consumes only `default`.
+// They're exposed so tests can call the helpers directly with their own
+// options (tmpdir, failing fs mocks) instead of mutating process env or
+// monkey-patching node:fs/promises at module scope.
 export {
   snapshotPrefix,
   buildSnapshot,

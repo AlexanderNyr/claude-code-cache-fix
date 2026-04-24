@@ -315,7 +315,7 @@ test("snapshotPrefix: corrupt prior snapshot is treated as no-prior", async () =
   }
 });
 
-test("snapshotPrefix: concurrent invocations both succeed; final snapshot is valid", async () => {
+test("snapshotPrefix: concurrent invocations both succeed; final snapshot matches one of the two payloads", async () => {
   const dir = await newTmp();
   try {
     const payloadA = makePayload();
@@ -333,13 +333,29 @@ test("snapshotPrefix: concurrent invocations both succeed; final snapshot is val
     });
     // Both same key (same system), so both write to same last.json
     assert.equal(results[0].key, results[1].key);
-    // At least one succeeded
+    // At least one succeeded (the other may have lost the rename race)
     assert.ok(results.some((r) => r.wroteSnapshot));
-    // Final last.json must be valid JSON, not partial
+    // Final last.json must be valid JSON (no torn write)
     const lastPath = join(dir, `${results[0].key}-last.json`);
     const json = JSON.parse(await readFile(lastPath, "utf-8"));
-    assert.equal(typeof json.timestamp, "string");
-    assert.ok(["payloadA", "payloadB"].length > 0); // sanity placeholder
+    // Stronger: the final file must equal one of the two candidate snapshots
+    // — not a mix of A and B, not a corrupt partial.
+    const snapshotA = buildSnapshot(payloadA);
+    const snapshotB = buildSnapshot(payloadB);
+    // Timestamps are generated at build time and will differ; compare the
+    // deterministic content fields (prefixMessages + counts/hashes).
+    const deterministic = ({ prefixMessages, messageCount, toolsHash, systemHash }) => ({
+      prefixMessages,
+      messageCount,
+      toolsHash,
+      systemHash,
+    });
+    const actual = JSON.stringify(deterministic(json));
+    assert.ok(
+      actual === JSON.stringify(deterministic(snapshotA)) ||
+        actual === JSON.stringify(deterministic(snapshotB)),
+      "final snapshot content must match exactly one of the two candidate payloads",
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -379,31 +395,39 @@ test("snapshotPrefix: hot-reload — re-importing module preserves disk-based di
 
 test("snapshotPrefix: mkdir failure with debug=1 logs but does not throw", async () => {
   const dir = await newTmp();
+  const prevDebug = process.env.CACHE_FIX_DEBUG;
   try {
+    // DEBUG is read at module-import time, so to test the logging path
+    // deterministically we set the env var then re-import the module with
+    // a cache-busting query string. This mirrors the hot-reload test.
+    process.env.CACHE_FIX_DEBUG = "1";
+    const url =
+      pathToFileURL(
+        join(import.meta.dirname, "..", "proxy", "extensions", "prefix-diff.mjs"),
+      ).href + "?debugReload=" + Date.now();
+    const reloaded = await import(url);
+
     const failingFs = {
       mkdir: async () => {
-        const err = new Error("simulated mkdir failure");
-        throw err;
+        throw new Error("simulated mkdir failure");
       },
     };
-    // Force the debug path: temporarily set env (module-level DEBUG is read at
-    // import; test the runtime debug() call via stderr capture regardless)
     const stderr = await captureStderr(async () => {
-      const result = await snapshotPrefix(makePayload(), {
+      const result = await reloaded.snapshotPrefix(makePayload(), {
         dir: join(dir, "subdir"),
         fs: failingFs,
       });
       assert.equal(result.wroteSnapshot, false);
+      assert.equal(result.wroteDiff, false);
     });
-    // We don't assert on the stderr content unconditionally because DEBUG
-    // is set at module import. We DO assert that the call didn't throw,
-    // which is the critical fail-open property.
-    // (If CACHE_FIX_DEBUG=1 was set when this test was loaded, stderr will
-    //  contain the mkdir failure message.)
-    if (process.env.CACHE_FIX_DEBUG === "1") {
-      assert.ok(stderr.includes("mkdir failed"));
-    }
+    // With DEBUG=1 at import time, the mkdir failure MUST be logged.
+    assert.ok(
+      stderr.includes("mkdir failed") && stderr.includes("simulated mkdir failure"),
+      `expected mkdir failure in stderr, got: ${JSON.stringify(stderr)}`,
+    );
   } finally {
+    if (prevDebug === undefined) delete process.env.CACHE_FIX_DEBUG;
+    else process.env.CACHE_FIX_DEBUG = prevDebug;
     await rm(dir, { recursive: true, force: true });
   }
 });
