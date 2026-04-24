@@ -281,6 +281,8 @@ export CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1
 
 Or add `"includeGitInstructions": false` to `~/.claude/settings.json`. Claude Code can still run `git status` via the Bash tool when it needs context. Community-validated by [@wadabum](https://github.com/cnighswonger/claude-code-cache-fix/issues/11): 18-token cache creation across git state changes (vs thousands without the flag).
 
+**Why we don't ship a proxy extension for this:** the proxy intercepts requests after Claude Code has already composed the system prompt — by then the volatile `git status` text is already part of the prefix that the model conditioned on in the previous turn, and stripping it post-hoc would itself bust the cache. The fix has to happen at the source. `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` prevents the injection before the prompt is composed, which is why the native flag is the right tool. Stripping post-hoc would also remove model-visible context that an explicit Bash call can recover, and would risk false-positive matches against assistant-written text.
+
 ## Image stripping (preload mode)
 
 Images read via the Read tool persist as base64 in conversation history, riding along on every subsequent API call. A single 500KB image costs ~62,500 tokens per turn on Opus 4.6, and **~85,000+ on Opus 4.7** due to the new tokenizer. Image stripping is strongly recommended on 4.7.
