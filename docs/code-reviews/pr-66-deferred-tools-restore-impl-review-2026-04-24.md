@@ -42,3 +42,17 @@ Request changes. The persist/restore mechanics, downgrade guard, mutation shape,
 ## Recommendation
 
 REQUEST CHANGES
+
+## Follow-up Verified
+
+Date: 2026-04-24
+Reviewed commit: `a158a4f`
+Reviewer: Codex Review Agent
+
+Re-checked the parser rewrite in `extractCwdFromSystem()` and reproduced the three false-positive shapes called out in the prior re-review.
+
+1. Fake marker inside a code fence after the real `# Environment` section in the same block now resolves to the real cwd (`/real/cwd`), not the fenced fake.
+2. A fenced fake `# Environment` block in an earlier system block plus a distinct real block later now returns `null` via the ambiguity guard instead of selecting the earlier fake cwd.
+3. Two structurally valid `# Environment` sections in one block where the first is fake and the second is real now return `null` via the ambiguity guard instead of selecting the first section.
+
+This closes the prior blocker. The parser is now bounded to the expected section shape and fails open on ambiguity, which matches the reviewed safety requirement.
