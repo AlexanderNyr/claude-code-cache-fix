@@ -2,8 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import ext, {
   snapshotPrefix,
@@ -13,6 +13,10 @@ import ext, {
   truncatePrefixMessages,
   diffHasChanges,
 } from "../proxy/extensions/prefix-diff.mjs";
+
+// `import.meta.dirname` requires Node 20.11+; CI matrix includes Node 18,
+// so derive the directory from import.meta.url for portability.
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // --- Helpers ---
 
@@ -371,7 +375,7 @@ test("snapshotPrefix: hot-reload — re-importing module preserves disk-based di
     // Re-import the module with cache-busting query string
     const url =
       pathToFileURL(
-        join(import.meta.dirname, "..", "proxy", "extensions", "prefix-diff.mjs"),
+        join(__dirname, "..", "proxy", "extensions", "prefix-diff.mjs"),
       ).href + "?reload=" + Date.now();
     const reloaded = await import(url);
 
@@ -403,7 +407,7 @@ test("snapshotPrefix: mkdir failure with debug=1 logs but does not throw", async
     process.env.CACHE_FIX_DEBUG = "1";
     const url =
       pathToFileURL(
-        join(import.meta.dirname, "..", "proxy", "extensions", "prefix-diff.mjs"),
+        join(__dirname, "..", "proxy", "extensions", "prefix-diff.mjs"),
       ).href + "?debugReload=" + Date.now();
     const reloaded = await import(url);
 
