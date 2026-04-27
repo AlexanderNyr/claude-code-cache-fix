@@ -334,6 +334,27 @@ export CACHE_FIX_IMAGE_KEEP_LAST=3
 
 Keeps images in the last 3 user messages, replaces older ones with a text placeholder. Only targets `tool_result` blocks — user-pasted images are never touched.
 
+### Oversized-image guard
+
+```bash
+export CACHE_FIX_IMAGE_MAX_DIM=2000
+```
+
+The Anthropic API enforces TWO image-related limits on multi-image requests, and the same error message can fire for either:
+
+> `"An image in the conversation exceeds the dimension limit for many-image requests (2000px). Start a new session with fewer images."`
+
+Two pressure axes to address them:
+
+| Pressure | Variable | What it does |
+|---|---|---|
+| **Too many images in conversation** | `CACHE_FIX_IMAGE_KEEP_LAST=N` | Strips images from old user messages, keeps only the last N. |
+| **Any single image too large** | `CACHE_FIX_IMAGE_MAX_DIM=2000` | Replaces images exceeding the dimension limit with a forensic placeholder noting the original dimensions. Covers both user-message direct images and tool_result-nested images. |
+
+The two compose: with both set, `KEEP_LAST` runs first (drops the count), then `MAX_DIM` runs on what remains (caps the size of the kept ones). Common triggers for the dimension axis: hi-res manuscript scans, retina screenshots, photos at full resolution.
+
+Pure-JS PNG and JPEG header parsing — no native deps. Other formats (GIF, WebP, AVIF, BMP) pass through unchanged regardless of dimension. Fail-open: images whose dimensions can't be parsed (truncated header, unsupported format) are kept rather than stripped — better to send a request that might error than to strip a valid image we just couldn't measure.
+
 ## System prompt rewrite (preload mode, optional)
 
 The interceptor can rewrite Claude Code's `# Output efficiency` system-prompt section. Disabled by default. Enable with `CACHE_FIX_OUTPUT_EFFICIENCY_REPLACEMENT`. See [docs/output-efficiency-prompts.md](docs/output-efficiency-prompts.md) for the three known prompt variants and usage instructions.
