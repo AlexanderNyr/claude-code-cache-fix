@@ -254,6 +254,38 @@ export CACHE_FIX_IMAGE_KEEP_LAST=3
 
 최근 3개 사용자 메시지의 이미지를 유지하고 이전 것은 텍스트 자리 표시자로 대체합니다. `tool_result` 블록만 대상이며, 사용자가 직접 붙여넣은 이미지는 영향받지 않습니다.
 
+### 이미지 가드 파이프라인 (v3.3.0)
+
+Anthropic의 실제 이미지 규칙을 그대로 반영하는 조건부 파이프라인입니다. 단일 환경 변수로 명시적 활성화:
+
+```bash
+export CACHE_FIX_IMAGE_GUARD=1
+```
+
+활성화 시 프록시는 다음을 실행합니다:
+
+| 패스 | 트리거 | 동작 |
+|------|--------|------|
+| **Pass 0** (레거시) | `CACHE_FIX_IMAGE_KEEP_LAST=N` 설정 | 가장 최근 N개 이외 사용자 메시지의 tool_result 이미지 제거 |
+| **Pass 3** | `CACHE_FIX_IMAGE_PRESERVE_DETAIL=1` AND 긴 변 > 모델 네이티브 캡 | `sharp`를 통해 네이티브 캡(Opus 4.7은 2576px, 그 외는 1568px)으로 Lanczos 리사이즈, 종횡비와 미디어 타입 보존 |
+| **Pass 1** | 긴 변 > 활성 거부 캡 | 제거 후 forensic 자리 표시자로 대체. 활성 캡 = `MAX_DIM` 설정 시 그 값, 아니면 2000px (개수 > 20일 때) 또는 8000px (개수 ≤ 20) |
+| **Pass 2** | 요청 본문이 `CACHE_FIX_IMAGE_REQUEST_SIZE_MAX` (기본 30 MB) 초과 | 예산 이하가 될 때까지 가장 오래된 이미지부터 제거 |
+| **개수 캡** | 잔여 이미지 개수 > `CACHE_FIX_IMAGE_COUNT_MAX` (기본 100) | 캡까지 가장 오래된 이미지 제거 |
+
+실행 순서: **Pass 0 → Pass 3 → Pass 1 → Pass 2 → 개수 캡**. 각 패스는 독립적입니다 — Pass 1은 절대 리사이즈하지 않으며, Pass 3는 절대 제거하지 않습니다.
+
+#### 선택적 `sharp` 의존성
+
+Pass 3는 Lanczos 리사이즈를 위해 [sharp](https://www.npmjs.com/package/sharp)가 필요합니다. **선택적 peer dependency**로 선언되어 있으며, Pass 3를 사용하려면 별도로 설치하십시오:
+
+```bash
+npm install sharp
+```
+
+`sharp`가 없는 경우 Pass 3는 깨끗하게 건너뛰며 (telemetry에 `library_missing: true`), Pass 1 + Pass 2 + 개수 캡은 정상 실행됩니다.
+
+전체 우선순위 매트릭스(레거시 + 신규 환경 변수의 모든 조합) 및 튜닝 가능한 항목은 [README.md](README.md#image-guard-pipeline-v330)를 참조하십시오.
+
 ## 시스템 프롬프트 재작성 (프리로드 모드, 선택)
 
 인터셉터가 Claude Code의 `# Output efficiency` 시스템 프롬프트 섹션을 재작성할 수 있습니다. 기본 비활성화입니다. `CACHE_FIX_OUTPUT_EFFICIENCY_REPLACEMENT`로 활성화하십시오. 세 가지 알려진 프롬프트 변형과 사용법은 [docs/output-efficiency-prompts.md](docs/output-efficiency-prompts.md)를 참조하십시오.

@@ -1,5 +1,41 @@
 # Changelog
 
+## 3.3.0 (2026-04-30)
+
+**`image-guard` pipeline** (#87, closes design discussion in #87 thread):
+
+Replaces v3.2.1's static `CACHE_FIX_IMAGE_MAX_DIM` with a conditional pipeline that mirrors Anthropic's actual image rules: the per-image dimension ceiling depends on image count (2000 px when count > 20, else 8000 px), the API enforces a 32 MB request body cap independently, and current-generation models accept up to 100 images per request. The new pipeline addresses all three axes; `MAX_DIM` only addressed the dimension axis with a single static value that overcorrected for ≤20-image requests.
+
+Five passes, all gated by a single top-level env var (`CACHE_FIX_IMAGE_GUARD=1`):
+
+| Pass | Trigger | Action |
+|------|---------|--------|
+| Pass 0 (legacy back-compat) | `CACHE_FIX_IMAGE_KEEP_LAST=N` set | Strip tool_result images from user messages older than N most recent |
+| Pass 3 (opt-in) | `CACHE_FIX_IMAGE_PRESERVE_DETAIL=1` AND long edge > model native cap | Lanczos resize via `sharp` to native cap (2576 px Opus 4.7, 1568 px otherwise), preserve aspect ratio and media type |
+| Pass 1 | long edge > active rejection cap | Strip with forensic placeholder. Cap = `MAX_DIM` if set, else 2000 (count > 20) or 8000 (count ≤ 20) |
+| Pass 2 | request body bytes > `CACHE_FIX_IMAGE_REQUEST_SIZE_MAX` (default 30 MB) | Drop oldest images until under budget |
+| Count cap | image count > `CACHE_FIX_IMAGE_COUNT_MAX` (default 100) | Drop oldest images down to cap |
+
+Execution order: **Pass 0 → Pass 3 → Pass 1 → Pass 2 → count cap**. Each pass is independent — Pass 1 never resizes; Pass 3 never strips. README's precedence matrix documents every supported env-var combination.
+
+**Optional `sharp` peer dependency.** Pass 3 requires [sharp](https://www.npmjs.com/package/sharp) for Lanczos resize. Declared in `peerDependenciesMeta` only (not `peerDependencies`) — users who don't want it pay nothing. If `sharp` is missing, Pass 3 logs `library_missing` and skips; Passes 0/1/2 + count cap still run.
+
+**Telemetry.** New `ctx.meta.imageGuardStats` carries the full counter set (counts + bytes + estimated tokens + library_missing flag). One stderr line per processed request when the pipeline did anything observable.
+
+**New env vars:**
+- `CACHE_FIX_IMAGE_GUARD=1` — top-level pipeline gate
+- `CACHE_FIX_IMAGE_PRESERVE_DETAIL=1` — enable Pass 3 Lanczos resize via `sharp`
+- `CACHE_FIX_IMAGE_REQUEST_SIZE_MAX=<bytes>` — Pass 2 byte budget (default 31457280 = 30 MB)
+- `CACHE_FIX_IMAGE_COUNT_MAX=<n>` — hard image-count cap (default 100; legacy Claude 1/2.x/Instant users can set 600)
+
+**Back-compat.** All v3.2.1 legacy paths (`CACHE_FIX_IMAGE_KEEP_LAST` only, `CACHE_FIX_IMAGE_MAX_DIM` only, both together) continue to work exactly as before — no migration required for existing users.
+
+**Tests:** 553 → 597 (44 new in `proxy-image-guard.test.mjs`, covering activation, every Pass, count cap, all 10 precedence-matrix rows, telemetry shape, sharp-unavailable + sharp-throws fallbacks, Pass 1 stderr emission, post-count-cap byte recompute). Pass 3 sharp tests use injected mocks — no real `sharp` install required to run the suite.
+
+**Reviewer dance:** Codex implementation review found 2 blockers + 1 telemetry-drift note; all addressed in commit `91017e8`. Final approval at commit `9983d6a`. Both gates met (`approved-by-lead` + `approved-by-codex-agent`) before merge.
+
+---
+
 ## 3.2.1 (2026-04-27)
 
 **Oversized-image guard for `image-strip`** (#84, requested by @X-15):

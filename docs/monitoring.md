@@ -100,6 +100,11 @@ Proxy mode uses extension configuration in `proxy/extensions.json`. These env va
 | `CACHE_FIX_DEBUG` | `0` | Enable debug logging to `~/.claude/cache-fix-debug.log` |
 | `CACHE_FIX_PREFIXDIFF` | `0` | Enable prefix snapshot diffing |
 | `CACHE_FIX_IMAGE_KEEP_LAST` | `0` | Keep images in last N user messages (0 = disabled) |
+| `CACHE_FIX_IMAGE_MAX_DIM` | `0` | Legacy strip-only cap (px). v3.2.1 behavior; still works standalone |
+| `CACHE_FIX_IMAGE_GUARD` | `0` | v3.3.0 image-guard pipeline gate. `=1` enables Pass 1 + Pass 2 + count cap |
+| `CACHE_FIX_IMAGE_PRESERVE_DETAIL` | `0` | Adds Pass 3 Lanczos resize via `sharp`. Requires `IMAGE_GUARD=1` |
+| `CACHE_FIX_IMAGE_REQUEST_SIZE_MAX` | `31457280` | Pass 2 byte budget (30 MB; 2 MB headroom from Anthropic's 32 MB ceiling) |
+| `CACHE_FIX_IMAGE_COUNT_MAX` | `100` | Hard image-count cap. Set `600` for legacy Claude 1/2.x/Instant if needed |
 | `CACHE_FIX_OUTPUT_EFFICIENCY_REPLACEMENT` | unset | Replace Claude Code's `# Output efficiency` system-prompt section |
 | `CACHE_FIX_USAGE_LOG` | `~/.claude/usage.jsonl` | Path for per-call usage telemetry log |
 | `CACHE_FIX_DISABLED` | `0` | Disable all bug fixes; keep monitoring + optimizations active |
