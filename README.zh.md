@@ -186,6 +186,120 @@ export CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1
 
 或在 `~/.claude/settings.json` 中添加 `"includeGitInstructions": false`。社区验证者 [@wadabum](https://github.com/cnighswonger/claude-code-cache-fix/issues/11)：跨 git 状态变化仅 18 token 缓存创建（禁用前为数千 token）。
 
+## 迁移：v3.4.x → v3.5.0+
+
+如果你编写了直接读取 `~/.claude/quota-status.json` 的自定义状态栏、监控脚本或其他工具，本节适用于你。v3.5.0 在代理模式下拆分了该文件；预加载模式保持不变。
+
+### 变更内容
+
+| | v3.4.x 及更早（代理 + 预加载） | v3.5.0+ 代理模式 | v3.5.0+ 预加载模式 |
+|---|---|---|---|
+| 配额字段（Q5h、Q7d、status、overage） | `~/.claude/quota-status.json` | `~/.claude/quota-status/account.json` | `~/.claude/quota-status.json`（旧路径） |
+| 缓存字段（TTL 层级、命中率、cache_creation/read） | 同上文件 | `~/.claude/quota-status/sessions/<filename>.json` | 同上文件 |
+| 多会话归属 | 无 — 后写者覆盖 | 按会话分文件 | 预加载按构造为单会话 |
+
+`<filename>` 由请求的 `x-claude-code-session-id` 头通过确定性安全名规则派生：UUID 等匹配 `[A-Za-z0-9_-]{1,128}` 的 id 直接通过；空/null/空白被映射为 `unknown`；其他映射为 `inv-<sha256-prefix>`。完整规则见 [`docs/directives/proxy-quota-status-per-session.md`](docs/directives/proxy-quota-status-per-session.md)。
+
+升级后第一次代理模式写入会自动删除旧版 `~/.claude/quota-status.json`。早于 `CACHE_FIX_QUOTA_STATUS_TTL_DAYS`（默认 `7`）的会话文件会在写入时被清理。
+
+### 消费方迁移模式
+
+你的脚本应优先尝试 v3.5.0+ 代理路径，失败时回退到旧路径。这样在两种模式下（以及升级中途的主机上）都能正常工作。会话 id 通常来自 Claude Code 调用状态栏 hook 时的 stdin；其他场景可从最近修改的 `~/.claude/projects/*/*.jsonl` 文件名捕获。
+
+**Bash（状态栏风格）：**
+```bash
+QS_DIR="$HOME/.claude/quota-status"
+ACCOUNT="$QS_DIR/account.json"
+LEGACY="$HOME/.claude/quota-status.json"
+
+# 文件名规范化规则 —— 必须与 proxy/extensions/cache-telemetry.mjs 中的
+# sessionFilename() 保持一致：先 trim；空 → unknown；匹配安全正则 → 直接通过；
+# 否则 → inv-<sha256-prefix>。否则空白/格式异常的 id 会读不到写入端按规范名
+# 创建的文件。
+session_filename() {
+  local trimmed
+  trimmed="$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [ -z "$trimmed" ]; then echo unknown; return; fi
+  if printf '%s' "$trimmed" | grep -qE '^[A-Za-z0-9_-]{1,128}$'; then
+    printf '%s' "$trimmed"
+  else
+    # Linux 上是 sha256sum，macOS 上是 shasum -a 256；两者均输出 "<hex>  -"。
+    local hash
+    if command -v sha256sum >/dev/null 2>&1; then
+      hash="$(printf '%s' "$trimmed" | sha256sum)"
+    else
+      hash="$(printf '%s' "$trimmed" | shasum -a 256)"
+    fi
+    printf 'inv-%s' "$(printf '%s' "$hash" | cut -c1-16)"
+  fi
+}
+
+# 会话 id：优先 CC stdin，回退最近的 jsonl
+sid="$(jq -r '.session_id // empty' 2>/dev/null < /dev/stdin || true)"
+if [ -z "$sid" ]; then
+  sid="$(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -1 | xargs -I{} basename {} .jsonl)"
+fi
+filename="$(session_filename "$sid")"
+
+# 配额：account.json（v3.5.0+）→ 回退旧路径
+if [ -f "$ACCOUNT" ]; then
+  quota_json="$(cat "$ACCOUNT")"
+elif [ -f "$LEGACY" ]; then
+  quota_json="$(cat "$LEGACY")"
+fi
+
+# 缓存：sessions/<filename>.json（v3.5.0+）→ 回退旧路径
+if [ -f "$QS_DIR/sessions/$filename.json" ]; then
+  cache_json="$(cat "$QS_DIR/sessions/$filename.json")"
+elif [ -f "$LEGACY" ]; then
+  cache_json="$(cat "$LEGACY")"
+fi
+```
+
+**Node：**
+```js
+import { readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { createHash } from "node:crypto";
+
+const home = homedir();
+const accountPath = join(home, ".claude", "quota-status", "account.json");
+const legacyPath = join(home, ".claude", "quota-status.json");
+
+const SAFE_NAME_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+// 与 cache-telemetry.mjs 的 sessionFilename() 保持一致。读取端规则必须与写入端
+// 一致；否则空白/格式异常的 id 会找不到对应的会话文件。
+function sessionFilename(rawId) {
+  if (rawId === null || rawId === undefined) return "unknown";
+  const s = String(rawId).trim();
+  if (s.length === 0) return "unknown";
+  if (SAFE_NAME_RE.test(s)) return s;
+  return "inv-" + createHash("sha256").update(s).digest("hex").slice(0, 16);
+}
+
+function readQuotaJson() {
+  if (existsSync(accountPath)) return JSON.parse(readFileSync(accountPath, "utf8"));
+  if (existsSync(legacyPath)) return JSON.parse(readFileSync(legacyPath, "utf8"));
+  return null;
+}
+
+function readCacheJson(sessionId) {
+  const filename = sessionFilename(sessionId);
+  const p = join(home, ".claude", "quota-status", "sessions", `${filename}.json`);
+  if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8"));
+  if (existsSync(legacyPath)) return JSON.parse(readFileSync(legacyPath, "utf8"));
+  return null;
+}
+```
+
+随包发布的 [`tools/quota-statusline.sh`](tools/quota-statusline.sh) 是 bash 版本的参考实现。[`/coffee` 技能](https://github.com/cnighswonger/claude-code-coffee) v1.4.0 是按会话保活闸门的参考。
+
+### 为什么按会话拆分
+
+在多代理主机上（多个 Claude Code 会话共享一个代理），v3.5.0 之前的单一全局文件会让每个会话用自己的响应覆盖其他会话的缓存统计。状态栏从会话 A 读取，但会话 B 最近发出请求时，会显示 B 的 TTL 层级。按会话分文件 + 一个账户级配额文件解决了这一问题，同时保留账户级整体视图。原始报告见 [#104](https://github.com/cnighswonger/claude-code-cache-fix/issues/104)。
+
 ## 图片剥离（预加载模式）
 
 通过 Read 工具读取的图片以 base64 持久化在对话历史中，在每次后续 API 调用时随行发送。单张 500KB 图片在 Opus 4.6 上每轮带来约 62,500 token 开销，**在 Opus 4.7 上约 85,000+ token**（因新分词器）。强烈建议在 4.7 上启用图片剥离。
