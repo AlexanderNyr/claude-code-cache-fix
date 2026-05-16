@@ -34,8 +34,8 @@ every <ping_interval> minutes (TTL-tier-aware):
     else:
       synthesize warming request from stored payload + minimal user message ("ping"), max_tokens: 1
       send to api.anthropic.com with stored auth header + X-Cache-Fix-Warmer: 1 (stripped before forward)
-      log result (cost, latency, cache_read tokens, error) to NDJSON
-      increment per-account daily cost counter
+      log result (latency, cache_read tokens, error) to NDJSON
+      increment per-account daily token counter by cache_read_input_tokens
       reset timer for S
 ```
 
