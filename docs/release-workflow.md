@@ -89,39 +89,21 @@ git push origin vX.Y.Z
 
 Annotated tags only (`-a`), not lightweight tags. The tag message can mirror the CHANGELOG section heading.
 
-### 8. npm publish (automated via `.github/workflows/release.yml`)
-
-**Do NOT run `npm publish` from a local box.** Pushing the `vX.Y.Z` tag in step 7 triggers `.github/workflows/release.yml`, which runs the full test suite on the tagged commit and then publishes to npm with **sigstore provenance attestation** enabled.
-
-The workflow authenticates via [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers) — no long-lived `NPM_TOKEN` secret required. The workflow's GitHub-minted OIDC token is exchanged for a short-lived publish credential at request time.
-
-Verify the workflow run:
+### 8. npm publish
 
 ```bash
-gh run list --repo cnighswonger/claude-code-cache-fix --workflow=release.yml --limit 1
-gh run watch --repo cnighswonger/claude-code-cache-fix  # tail the most recent run
+npm publish
 ```
 
-Verify the publish landed AND has provenance:
+The npm token lives at `~/.claude/.npm/.npmrc` for the `vsitsllc` org (see `~/.claude/memory/shared/reference_npm_token.md` for current expiry — token rotates roughly every 90 days). If publish fails on auth, the token may have expired; ask Chris to rotate before retrying.
+
+Verify the publish landed:
 
 ```bash
 npm view claude-code-cache-fix version
-# Should return the new version within ~30 seconds.
-
-npm view claude-code-cache-fix@<new-version> dist.attestations
-# Should return a non-empty array citing the GitHub Actions workflow run.
 ```
 
-**One-time setup (already done — record for future maintainers).** Trusted Publishing was configured on the npm side at https://www.npmjs.com/package/claude-code-cache-fix/access → Trusted Publishers → Add → GitHub Actions, with:
-
-- **Organization:** `cnighswonger`
-- **Repository:** `claude-code-cache-fix`
-- **Workflow filename:** `release.yml`
-- **Environment name:** `npm-publish` (must match the `environment:` value in the workflow job)
-
-If the workflow filename or environment name ever changes, the npm-side config must be updated in lockstep — mismatch fails auth silently.
-
-**Local-publish fallback (emergency only).** If the workflow is broken or GitHub Actions is down and the release truly cannot wait, the operator can still publish locally: `npm publish` (without `--provenance` — local publish has no OIDC source). This drops the attestation for that release; document the gap in CHANGELOG. Per #133, this should be a rare exception, not the default. The local `~/.claude/.npm/.npmrc` token (per `reference_npm_token.md`) is retained specifically for this emergency path.
+Should return the new version within ~30 seconds.
 
 ### 9. GitHub Release
 
