@@ -16,24 +16,25 @@
 // boundary. Works on any CC version routed through cache-fix-proxy without
 // waiting for Anthropic to ship the CLI fix.
 //
-// Config (env var; built-in default is "disabled"):
+// Config (env var; built-in default is "summarized"):
 //   CACHE_FIX_THINKING_DISPLAY=summarized — inject display: "summarized"
-//     (main case; restores summaries in IDE/SDK/--print)
+//     (main case; restores summaries in IDE/SDK/--print). DEFAULT.
 //   CACHE_FIX_THINKING_DISPLAY=omitted    — inject display: "omitted"
 //     (force-suppress override; for agent runtimes that don't want thinking
 //     blocks at all, regardless of what their CLI sends)
 //   CACHE_FIX_THINKING_DISPLAY=disabled   — no injection; extension is a no-op
 //
-// Default is "disabled" until the cache-prefix impact of injecting the field
-// is verified empirically. See README and the PR landing this extension for
-// the cache-prefix test result and the rationale for the eventual default.
+// Default flipped to "summarized" in v3.6.1 after the cache-prefix test on
+// Opus 4.7 measured 0% absolute drop in steady-state cache_read ratio with
+// injection enabled (well inside the ≤5% "preserved" threshold). Users who
+// want the older "no injection" behavior set CACHE_FIX_THINKING_DISPLAY=disabled.
 
 const MODEL_REGEX = /^claude-opus-4-7/;
 
 function resolveMode() {
   const v = process.env.CACHE_FIX_THINKING_DISPLAY;
   if (v === "summarized" || v === "omitted" || v === "disabled") return v;
-  return "disabled";
+  return "summarized";
 }
 
 // Thinking types that produce thinking blocks. CC v2.1.131+ ships

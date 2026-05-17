@@ -26,21 +26,24 @@ test("resolveMode: returns env value when set to omitted", () => {
   }
 });
 
-test("resolveMode: returns disabled built-in default when env unset", () => {
+test("resolveMode: returns summarized built-in default when env unset", () => {
+  // Default flipped from "disabled" to "summarized" after the cache-prefix
+  // test on Opus 4.7 showed 0% absolute drop in steady-state cache_read
+  // ratio (PR #131 cache-test comment).
   const saved = process.env.CACHE_FIX_THINKING_DISPLAY;
   delete process.env.CACHE_FIX_THINKING_DISPLAY;
   try {
-    assert.equal(resolveMode(), "disabled");
+    assert.equal(resolveMode(), "summarized");
   } finally {
     if (saved !== undefined) process.env.CACHE_FIX_THINKING_DISPLAY = saved;
   }
 });
 
-test("resolveMode: rejects unrecognized env values, falls back to disabled", () => {
+test("resolveMode: rejects unrecognized env values, falls back to summarized default", () => {
   const saved = process.env.CACHE_FIX_THINKING_DISPLAY;
   process.env.CACHE_FIX_THINKING_DISPLAY = "garbage";
   try {
-    assert.equal(resolveMode(), "disabled");
+    assert.equal(resolveMode(), "summarized");
   } finally {
     if (saved === undefined) delete process.env.CACHE_FIX_THINKING_DISPLAY;
     else process.env.CACHE_FIX_THINKING_DISPLAY = saved;
@@ -285,7 +288,9 @@ test("onRequest: skips requests with no thinking block", async () => {
   assert.equal(ctx.meta.thinkingDisplayInjected, undefined);
 });
 
-test("onRequest: built-in default (env unset) is no-op", async () => {
+test("onRequest: built-in default (env unset) is summarized injection", async () => {
+  // Post-default-flip: env-unset means "summarized" by default, not no-op.
+  // Users who want the old no-op behavior set CACHE_FIX_THINKING_DISPLAY=disabled.
   const saved = process.env.CACHE_FIX_THINKING_DISPLAY;
   delete process.env.CACHE_FIX_THINKING_DISPLAY;
   const body = {
@@ -298,6 +303,6 @@ test("onRequest: built-in default (env unset) is no-op", async () => {
   } finally {
     if (saved !== undefined) process.env.CACHE_FIX_THINKING_DISPLAY = saved;
   }
-  assert.equal(ctx.body.thinking.display, undefined);
-  assert.equal(ctx.meta.thinkingDisplayInjected, undefined);
+  assert.equal(ctx.body.thinking.display, "summarized");
+  assert.equal(ctx.meta.thinkingDisplayInjected, "summarized");
 });

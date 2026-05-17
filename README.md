@@ -634,7 +634,7 @@ export CACHE_FIX_THINKING_DISPLAY=omitted
 export CACHE_FIX_THINKING_DISPLAY=disabled
 ```
 
-The extension is **default-off** until the cache-prefix impact of injecting the field is verified empirically. Adding `thinking.display` to the request body changes the bytes Anthropic hashes for cache lookup; if the injection breaks prefix matching, the cost is "thinking summaries restored, prompt-cache benefit lost" — for high-context sessions that's a meaningful tradeoff, so the user opts in deliberately. The PR landing this extension documents the cache test result and the rationale for the eventual default. Watch the release notes.
+The extension is **default-on** as of v3.6.1. The cache-prefix test measured 0% absolute drop in steady-state `cache_read` ratio when injection is active on Opus 4.7 (5 sequential `claude -p` calls per window, baseline vs injected — both windows held 1.000 cache_read ratio from call 2 onward). Adding `thinking.display` to the request body changes the bytes Anthropic hashes, but Anthropic's cache layer accepts and indexes the injected-prefix the same way it does any other prefix. Users who want the older "no injection" behavior (e.g. to avoid any request-body mutation at all) explicitly set `CACHE_FIX_THINKING_DISPLAY=disabled`.
 
 Scoping rules baked into the extension:
 
@@ -644,7 +644,7 @@ Scoping rules baked into the extension:
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
-| `CACHE_FIX_THINKING_DISPLAY` | `disabled` (built-in) | One of `summarized` / `omitted` / `disabled`. Determines what value (if any) the extension injects when conditions are met. |
+| `CACHE_FIX_THINKING_DISPLAY` | `summarized` (built-in) | One of `summarized` / `omitted` / `disabled`. `summarized` restores thinking summaries (default). `omitted` force-suppresses thinking blocks. `disabled` opts the extension out entirely. |
 
 ## System prompt rewrite (preload mode, optional)
 
