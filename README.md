@@ -246,7 +246,7 @@ For manual VS Code wrapper setup (without the VSIX), see [docs/preload-setup.md]
 
 **What it does NOT do:** No network calls from the proxy or interceptor. All telemetry is written to local files under `~/.claude/`. No data leaves your machine.
 
-**Supply chain:** Proxy mode: 7 small extension modules in `proxy/extensions/` (each under 200 lines). Preload mode: single unminified file (`preload.mjs`, ~1,700 lines). One dev dependency (`zod` for schema validation in tests only). Review before installing. npm provenance links each published version to its source commit.
+**Supply chain:** Proxy mode: 7 small extension modules in `proxy/extensions/` (each under 200 lines). Preload mode: single unminified file (`preload.mjs`, ~1,700 lines). One dev dependency (`zod` for schema validation in tests only). Review before installing. Published builds carry npm's default registry signatures; sigstore provenance attestation is not currently published — tracked as a follow-up.
 
 **Independent audit:** [Assessed as "LEGITIMATE TOOL"](https://github.com/anthropics/claude-code/issues/38335#issuecomment-4244413605) by @TheAuditorTool (2026-04-14).
 
