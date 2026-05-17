@@ -624,13 +624,13 @@ On Opus 4.7, Anthropic flipped the API default for `thinking.display` from `"sum
 Upstream root cause and patch proposed in [anthropics/claude-code#59844](https://github.com/anthropics/claude-code/issues/59844) (credit: [@ojura](https://github.com/ojura)). This extension is the proxy-side complement: when a request to an Opus 4.7 endpoint has thinking enabled but `display` unset, inject the configured mode at the API boundary. Works on any CC version routed through cache-fix-proxy, no waiting on Anthropic to ship the CLI fix.
 
 ```sh
-# Restore summaries (main case — non-interactive surfaces get reasoning content)
+# Restore summaries (the built-in default — non-interactive surfaces get reasoning content)
 export CACHE_FIX_THINKING_DISPLAY=summarized
 
 # Force-suppress override (agent runtimes that don't want thinking blocks at all)
 export CACHE_FIX_THINKING_DISPLAY=omitted
 
-# Explicit no-op (extension disabled — also the built-in default)
+# Explicit no-op (extension passes through unchanged)
 export CACHE_FIX_THINKING_DISPLAY=disabled
 ```
 
