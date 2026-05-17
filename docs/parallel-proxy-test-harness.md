@@ -86,8 +86,10 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:9802 \
   --output-format stream-json --include-partial-messages --verbose \
   > /tmp/test-output.jsonl 2>&1
 
-# 5. Inspect: what reached the proxy?
-cat /tmp/test-debug.jsonl | python3 -m json.tool
+# 5. Inspect: what reached the proxy? (jq handles multi-line JSONL natively.)
+jq . /tmp/test-debug.jsonl
+# Or, if you only care about the last request:
+tail -1 /tmp/test-debug.jsonl | python3 -m json.tool
 
 # 6. Inspect: what came back from Anthropic? Walk the stream-json events.
 python3 - <<'PY'
