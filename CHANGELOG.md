@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [3.6.1] - 2026-05-17
+
+### Added
+
+- **`thinking-display` extension: restores Opus 4.7 thinking summaries in non-interactive CC surfaces (#131, closes #130).** Anthropic flipped the `thinking.display` API default to `"omitted"` on Opus 4.7, and Claude Code's CLI gates `display: "summarized"` behind `!getIsNonInteractiveSession()` — so every CC subprocess spawned with `--input-format stream-json` (VS Code chat panel, Antigravity panel, SDK, `claude --print`, etc.) sends a thinking-enabled request without `display`, and the API returns thinking blocks whose `thinking` field is empty plus a multi-KB signature. The UI shows a static "Thinking" stub but no reasoning content. This extension injects `thinking.display = "summarized"` at the proxy boundary when the request is on `claude-opus-4-7*`, `thinking.type` is `"enabled"` or `"adaptive"`, and `display` is unset — works on any CC version routed through cache-fix-proxy without waiting on the upstream CLI fix. Upstream root cause / patch proposal in [anthropics/claude-code#59844](https://github.com/anthropics/claude-code/issues/59844) — credit to [@ojura](https://github.com/ojura). Default is `summarized` (default-on for Opus 4.7) after the cache-prefix test on PR #131 measured 0% absolute drop in steady-state `cache_read` ratio (5 sequential `claude -p` calls per window, baseline vs injected — both windows held 1.000 cache_read ratio from call 2 onward, comfortably inside the ≤5% "preserved" threshold pinned in the PR body before the test ran). Users who want no injection set `CACHE_FIX_THINKING_DISPLAY=disabled`; users who want explicit thinking suppression set `CACHE_FIX_THINKING_DISPLAY=omitted`. User opt-out is always preserved — if a request already has `thinking.display` set (either `"summarized"` or `"omitted"`), the extension never overwrites. Model-gated regex is intentionally narrow (`/^claude-opus-4-7/`); Sonnet 4.7 and future versions require explicit verification + a cache-fix bump rather than auto-applying unverified behavior.
+
+- **`docs/parallel-proxy-test-harness.md`: developer test harness for end-to-end extension testing.** Documents the pattern used during #131 work: spin up a parallel proxy on `:9802` from the feature branch, route `claude -p` traffic through it (bypassing the local wrapper that hardcodes `:9801`), capture real request bodies via a diagnostic extension, run baseline-vs-injected comparisons against live Anthropic API. The harness surfaced the spec/reality mismatch on #130 (CC v2.1.131 ships `thinking.type: "adaptive"`, not `"enabled"` as the upstream issue described) that no unit test would have caught — captured here as a standing pattern for every future extension PR. Six gotchas inlined (`~/bin/claude` wrapper hardcoding, `--verbose` requirement for `stream-json`, env-vars-need-restart, PID-discovery via `ss -tlnp`, `pkill -f` self-kill risk, adaptive-thinking-is-model-decided).
+
+### Tests
+
+793 → 824 (+31): 31 new tests for `thinking-display` covering `resolveMode` (env values, fallback, garbage rejection), `MODEL_REGEX` (Opus 4.7 + 1m variant, negative cases for 4.6, Sonnet, future 4.8), `shouldInject` (all combinations of model × thinking state × display state, including the `adaptive` type discovered during live test), and `onRequest` end-to-end (each mode × each body shape, plus the pinned user-opt-out preservation case for both explicit `"omitted"` and explicit `"summarized"`).
+
 ## [3.6.0] - 2026-05-14
 
 ### Added
