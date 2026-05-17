@@ -615,6 +615,35 @@ The Mode A/B separation protects against cases where the sentinel might be follo
 | `CACHE_FIX_MICROCOMPACT_REDACT_LEN` | `64` | Mode B prefix length in dump records. Set to `0` to suppress the prefix entirely. |
 | `CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED` | unset | Add post-normalization text alongside (not replacing) raw `sentinel_text` in dump records. |
 
+## Thinking summaries (proxy mode, opt-in, Opus 4.7+)
+
+On Opus 4.7, Anthropic flipped the API default for `thinking.display` from `"summarized"` to `"omitted"`. In parallel, Claude Code's CLI has a `!getIsNonInteractiveSession()` gate that propagates `display: "summarized"` only when the session is interactive. The combination means every CC subprocess spawned with `--input-format stream-json` — the VS Code chat panel, the Antigravity panel, the SDK, `claude --print` — sends a request with `thinking.type: "enabled"` but no `display` field, and the API responds with thinking blocks whose `thinking` field is empty (plus a multi-KB signature). The UI shows a static "Thinking" stub while the agent runs but never any reasoning content.
+
+Upstream root cause and patch proposed in [anthropics/claude-code#59844](https://github.com/anthropics/claude-code/issues/59844) (credit: [@ojura](https://github.com/ojura)). This extension is the proxy-side complement: when a request to an Opus 4.7 endpoint has thinking enabled but `display` unset, inject the configured mode at the API boundary. Works on any CC version routed through cache-fix-proxy, no waiting on Anthropic to ship the CLI fix.
+
+```sh
+# Restore summaries (main case — non-interactive surfaces get reasoning content)
+export CACHE_FIX_THINKING_DISPLAY=summarized
+
+# Force-suppress override (agent runtimes that don't want thinking blocks at all)
+export CACHE_FIX_THINKING_DISPLAY=omitted
+
+# Explicit no-op (extension disabled — also the built-in default)
+export CACHE_FIX_THINKING_DISPLAY=disabled
+```
+
+The extension is **default-off** until the cache-prefix impact of injecting the field is verified empirically. Adding `thinking.display` to the request body changes the bytes Anthropic hashes for cache lookup; if the injection breaks prefix matching, the cost is "thinking summaries restored, prompt-cache benefit lost" — for high-context sessions that's a meaningful tradeoff, so the user opts in deliberately. The PR landing this extension documents the cache test result and the rationale for the eventual default. Watch the release notes.
+
+Scoping rules baked into the extension:
+
+- **Model-gated.** Only fires on requests whose `model` matches `/^claude-opus-4-7/` — covers `claude-opus-4-7` and `claude-opus-4-7-1m`. Sonnet 4.7 needs separate verification (the API default-flip may differ); future versions (4.8+) require an explicit cache-fix bump rather than auto-applying unverified behavior.
+- **User opt-out preserved.** If the request already has `thinking.display` set (either `"summarized"` or `"omitted"`), the extension never overwrites. Explicit user choice always wins.
+- **Thinking-disabled requests skipped.** If `thinking.type !== "enabled"`, no injection.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CACHE_FIX_THINKING_DISPLAY` | `disabled` (built-in) | One of `summarized` / `omitted` / `disabled`. Determines what value (if any) the extension injects when conditions are met. |
+
 ## System prompt rewrite (preload mode, optional)
 
 The interceptor can rewrite Claude Code's `# Output efficiency` system-prompt section. Disabled by default. Enable with `CACHE_FIX_OUTPUT_EFFICIENCY_REPLACEMENT`. See [docs/output-efficiency-prompts.md](docs/output-efficiency-prompts.md) for the three known prompt variants and usage instructions.
