@@ -43,6 +43,8 @@ On every `/v1/messages` request, 7 extensions run in order:
 
 Extensions are hot-reloadable — add, remove, or modify `.mjs` files in `proxy/extensions/` and changes apply to the next request without restarting. Configuration in `proxy/extensions.json`.
 
+**Developing a new extension?** See [docs/parallel-proxy-test-harness.md](docs/parallel-proxy-test-harness.md) for the pattern we use to test extensions end-to-end against real `claude -p` traffic without disturbing the production proxy.
+
 ### Running as a service
 
 **Recommended (Linux/macOS) — `install-service` subcommand:**
