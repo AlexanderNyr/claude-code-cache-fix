@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import ext, { MODEL_REGEX, resolveMode, shouldInject } from "../proxy/extensions/thinking-display.mjs";
+import ext, { MODEL_REGEX, ACTIVE_THINKING_TYPES, resolveMode, shouldInject } from "../proxy/extensions/thinking-display.mjs";
 
 // ─── resolveMode ───────────────────────────────────────────────────────────
 
@@ -77,10 +77,31 @@ test("MODEL_REGEX: does NOT match future Opus 4.8 (forces a cache-fix bump per p
 
 // ─── shouldInject ─────────────────────────────────────────────────────────
 
-test("shouldInject: true for Opus 4.7 with thinking enabled and display unset", () => {
+test("ACTIVE_THINKING_TYPES contains both enabled and adaptive", () => {
+  // CC v2.1.131+ ships type: "adaptive" by default on the Bun binary's
+  // non-interactive paths; older configs / explicit-budget setups send
+  // "enabled". Both produce the empty-thinking-block symptom when display
+  // is unset on Opus 4.7, so both are in scope. Empirically verified
+  // against live claude -p traffic 2026-05-17.
+  assert.ok(ACTIVE_THINKING_TYPES.has("enabled"));
+  assert.ok(ACTIVE_THINKING_TYPES.has("adaptive"));
+});
+
+test("shouldInject: true for Opus 4.7 with thinking type=enabled and display unset", () => {
   const body = {
     model: "claude-opus-4-7",
     thinking: { type: "enabled", budget_tokens: 10000 },
+  };
+  assert.equal(shouldInject(body), true);
+});
+
+test("shouldInject: true for Opus 4.7 with thinking type=adaptive and display unset (live CC v2.1.131 shape)", () => {
+  // This is the actual shape current CC versions ship. Verified by live
+  // claude -p capture 2026-05-17 — without this case, the extension is a
+  // no-op for current users.
+  const body = {
+    model: "claude-opus-4-7",
+    thinking: { type: "adaptive" },
   };
   assert.equal(shouldInject(body), true);
 });
@@ -103,10 +124,21 @@ test("shouldInject: false when display is explicitly omitted by user (preserves 
   assert.equal(shouldInject(body), false);
 });
 
-test("shouldInject: false when thinking is not enabled", () => {
+test("shouldInject: false when thinking is not enabled (type: disabled)", () => {
   const body = {
     model: "claude-opus-4-7",
     thinking: { type: "disabled" },
+  };
+  assert.equal(shouldInject(body), false);
+});
+
+test("shouldInject: false for unknown thinking type values (defensive)", () => {
+  // If Anthropic ships a new thinking.type value (e.g. "deep", "instant"),
+  // we'd rather miss the fix and require a cache-fix bump than auto-apply
+  // potentially incorrect behavior.
+  const body = {
+    model: "claude-opus-4-7",
+    thinking: { type: "future-mode" },
   };
   assert.equal(shouldInject(body), false);
 });
@@ -157,10 +189,23 @@ async function runOnRequest(mode, body) {
   return ctx;
 }
 
-test("onRequest: summarized mode injects display=summarized on Opus 4.7 unset", async () => {
+test("onRequest: summarized mode injects display=summarized on Opus 4.7 unset (type=enabled)", async () => {
   const body = {
     model: "claude-opus-4-7",
     thinking: { type: "enabled", budget_tokens: 10000 },
+  };
+  const ctx = await runOnRequest("summarized", body);
+  assert.equal(ctx.body.thinking.display, "summarized");
+  assert.equal(ctx.meta.thinkingDisplayInjected, "summarized");
+});
+
+test("onRequest: summarized mode injects display=summarized on Opus 4.7 unset (type=adaptive — live CC shape)", async () => {
+  // The shape current CC versions actually ship. The end-to-end claude -p
+  // test 2026-05-17 confirmed this is the critical case for the user-visible
+  // fix — without adaptive in scope, the extension is a no-op for everyone.
+  const body = {
+    model: "claude-opus-4-7",
+    thinking: { type: "adaptive" },
   };
   const ctx = await runOnRequest("summarized", body);
   assert.equal(ctx.body.thinking.display, "summarized");

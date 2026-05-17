@@ -617,7 +617,7 @@ The Mode A/B separation protects against cases where the sentinel might be follo
 
 ## Thinking summaries (proxy mode, opt-in, Opus 4.7+)
 
-On Opus 4.7, Anthropic flipped the API default for `thinking.display` from `"summarized"` to `"omitted"`. In parallel, Claude Code's CLI has a `!getIsNonInteractiveSession()` gate that propagates `display: "summarized"` only when the session is interactive. The combination means every CC subprocess spawned with `--input-format stream-json` — the VS Code chat panel, the Antigravity panel, the SDK, `claude --print` — sends a request with `thinking.type: "enabled"` but no `display` field, and the API responds with thinking blocks whose `thinking` field is empty (plus a multi-KB signature). The UI shows a static "Thinking" stub while the agent runs but never any reasoning content.
+On Opus 4.7, Anthropic flipped the API default for `thinking.display` from `"summarized"` to `"omitted"`. In parallel, Claude Code's CLI has a `!getIsNonInteractiveSession()` gate that propagates `display: "summarized"` only when the session is interactive. The combination means every CC subprocess spawned with `--input-format stream-json` — the VS Code chat panel, the Antigravity panel, the SDK, `claude --print` — sends a thinking-enabled request (`thinking.type` is either `"enabled"` or `"adaptive"` depending on CC version) without `display`, and the API responds with thinking blocks whose `thinking` field is empty (plus a multi-KB signature). The UI shows a static "Thinking" stub while the agent runs but never any reasoning content.
 
 Upstream root cause and patch proposed in [anthropics/claude-code#59844](https://github.com/anthropics/claude-code/issues/59844) (credit: [@ojura](https://github.com/ojura)). This extension is the proxy-side complement: when a request to an Opus 4.7 endpoint has thinking enabled but `display` unset, inject the configured mode at the API boundary. Works on any CC version routed through cache-fix-proxy, no waiting on Anthropic to ship the CLI fix.
 
@@ -638,7 +638,7 @@ Scoping rules baked into the extension:
 
 - **Model-gated.** Only fires on requests whose `model` matches `/^claude-opus-4-7/` — covers `claude-opus-4-7` and `claude-opus-4-7-1m`. Sonnet 4.7 needs separate verification (the API default-flip may differ); future versions (4.8+) require an explicit cache-fix bump rather than auto-applying unverified behavior.
 - **User opt-out preserved.** If the request already has `thinking.display` set (either `"summarized"` or `"omitted"`), the extension never overwrites. Explicit user choice always wins.
-- **Thinking-disabled requests skipped.** If `thinking.type !== "enabled"`, no injection.
+- **Thinking-active types only.** The extension fires on `thinking.type` ∈ `{ "enabled", "adaptive" }` — the two active modes that produce thinking blocks on Opus 4.7. Other values (`"disabled"`, future modes) are skipped. Conservative: if Anthropic ships a new thinking type with different display semantics, we'd rather miss the fix than auto-apply incorrect behavior.
 
 | Env var | Default | Purpose |
 |---------|---------|---------|

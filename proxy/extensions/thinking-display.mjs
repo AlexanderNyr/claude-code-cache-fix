@@ -36,18 +36,25 @@ function resolveMode() {
   return "disabled";
 }
 
+// Thinking types that produce thinking blocks. CC v2.1.131+ ships
+// `type: "adaptive"` (dynamic-budget mode) by default for the Bun binary's
+// non-interactive paths; older versions and explicit-budget configs may
+// still send `"enabled"`. Both produce the same empty-thinking symptom
+// when `display` is unset on Opus 4.7, so both are in scope.
+const ACTIVE_THINKING_TYPES = new Set(["enabled", "adaptive"]);
+
 function shouldInject(body) {
   if (!body || typeof body !== "object") return false;
   if (typeof body.model !== "string") return false;
   if (!MODEL_REGEX.test(body.model)) return false;
   if (!body.thinking || typeof body.thinking !== "object") return false;
-  if (body.thinking.type !== "enabled") return false;
+  if (!ACTIVE_THINKING_TYPES.has(body.thinking.type)) return false;
   // Only inject when display is unset. Preserve any explicit user choice
   // (including explicit "omitted" for compliance opt-out).
   return body.thinking.display === undefined;
 }
 
-export { MODEL_REGEX, resolveMode, shouldInject };
+export { MODEL_REGEX, ACTIVE_THINKING_TYPES, resolveMode, shouldInject };
 
 export default {
   name: "thinking-display",
