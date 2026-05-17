@@ -43,6 +43,8 @@ On every `/v1/messages` request, 7 extensions run in order:
 
 Extensions are hot-reloadable — add, remove, or modify `.mjs` files in `proxy/extensions/` and changes apply to the next request without restarting. Configuration in `proxy/extensions.json`.
 
+**Developing a new extension?** See [docs/parallel-proxy-test-harness.md](docs/parallel-proxy-test-harness.md) for the pattern we use to test extensions end-to-end against real `claude -p` traffic without disturbing the production proxy.
+
 ### Running as a service
 
 **Recommended (Linux/macOS) — `install-service` subcommand:**
@@ -614,6 +616,35 @@ The Mode A/B separation protects against cases where the sentinel might be follo
 | `CACHE_FIX_MICROCOMPACT_SENTINEL_PREFIX_<N>` | unset | Custom Mode B literal prefix(es). Pair with a custom Mode A pattern from a non-default sentinel family so prefix-only variants of that family also get redacted Mode B capture. |
 | `CACHE_FIX_MICROCOMPACT_REDACT_LEN` | `64` | Mode B prefix length in dump records. Set to `0` to suppress the prefix entirely. |
 | `CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED` | unset | Add post-normalization text alongside (not replacing) raw `sentinel_text` in dump records. |
+
+## Thinking summaries (proxy mode, opt-in, Opus 4.7+)
+
+On Opus 4.7, Anthropic flipped the API default for `thinking.display` from `"summarized"` to `"omitted"`. In parallel, Claude Code's CLI has a `!getIsNonInteractiveSession()` gate that propagates `display: "summarized"` only when the session is interactive. The combination means every CC subprocess spawned with `--input-format stream-json` — the VS Code chat panel, the Antigravity panel, the SDK, `claude --print` — sends a thinking-enabled request (`thinking.type` is either `"enabled"` or `"adaptive"` depending on CC version) without `display`, and the API responds with thinking blocks whose `thinking` field is empty (plus a multi-KB signature). The UI shows a static "Thinking" stub while the agent runs but never any reasoning content.
+
+Upstream root cause and patch proposed in [anthropics/claude-code#59844](https://github.com/anthropics/claude-code/issues/59844) (credit: [@ojura](https://github.com/ojura)). This extension is the proxy-side complement: when a request to an Opus 4.7 endpoint has thinking enabled but `display` unset, inject the configured mode at the API boundary. Works on any CC version routed through cache-fix-proxy, no waiting on Anthropic to ship the CLI fix.
+
+```sh
+# Restore summaries (the built-in default — non-interactive surfaces get reasoning content)
+export CACHE_FIX_THINKING_DISPLAY=summarized
+
+# Force-suppress override (agent runtimes that don't want thinking blocks at all)
+export CACHE_FIX_THINKING_DISPLAY=omitted
+
+# Explicit no-op (extension passes through unchanged)
+export CACHE_FIX_THINKING_DISPLAY=disabled
+```
+
+The extension is **default-on** as of v3.6.1. The cache-prefix test measured 0% absolute drop in steady-state `cache_read` ratio when injection is active on Opus 4.7 (5 sequential `claude -p` calls per window, baseline vs injected — both windows held 1.000 cache_read ratio from call 2 onward). Adding `thinking.display` to the request body changes the bytes Anthropic hashes, but Anthropic's cache layer accepts and indexes the injected-prefix the same way it does any other prefix. Users who want the older "no injection" behavior (e.g. to avoid any request-body mutation at all) explicitly set `CACHE_FIX_THINKING_DISPLAY=disabled`.
+
+Scoping rules baked into the extension:
+
+- **Model-gated.** Only fires on requests whose `model` matches `/^claude-opus-4-7/` — covers `claude-opus-4-7` and `claude-opus-4-7-1m`. Sonnet 4.7 needs separate verification (the API default-flip may differ); future versions (4.8+) require an explicit cache-fix bump rather than auto-applying unverified behavior.
+- **User opt-out preserved.** If the request already has `thinking.display` set (either `"summarized"` or `"omitted"`), the extension never overwrites. Explicit user choice always wins.
+- **Thinking-active types only.** The extension fires on `thinking.type` ∈ `{ "enabled", "adaptive" }` — the two active modes that produce thinking blocks on Opus 4.7. Other values (`"disabled"`, future modes) are skipped. Conservative: if Anthropic ships a new thinking type with different display semantics, we'd rather miss the fix than auto-apply incorrect behavior.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CACHE_FIX_THINKING_DISPLAY` | `summarized` (built-in) | One of `summarized` / `omitted` / `disabled`. `summarized` restores thinking summaries (default). `omitted` force-suppresses thinking blocks. `disabled` opts the extension out entirely. |
 
 ## System prompt rewrite (preload mode, optional)
 
