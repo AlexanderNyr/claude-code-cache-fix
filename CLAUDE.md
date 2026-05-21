@@ -31,7 +31,7 @@ All `gh` writes from this repo run under the `vsits-proxy-builder[bot]` App iden
 - Before any re-review, fetch the current PR head/ref first. Do not assume the previously viewed diff is still current.
 - Every PR review must leave a PR comment summarizing the review result.
 - Before taking any PR action, read the full existing PR comment thread so you do not act on stale or partial context.
-- **All PR and issue comments must be postfixed with the agent name** as a sign-off (e.g. `— Manager Agent`, `— Proxy Builder`, `— Codex review`). Do not prefix comments with the agent name. This is required for audit trail and cross-agent coordination.
+- **All PR and issue comments must be postfixed with the agent name** as a sign-off (e.g. `— AI Team Lead`, `— Proxy Builder`, `— Codex review`). Do not prefix comments with the agent name. This is required for audit trail and cross-agent coordination.
 - PR review must explicitly check whether tests cover the changed execution path.
 - If there are blocking issues, post the findings in the PR comment and do not add an approval label.
 - If the work under review is a directive/spec only, post the plan review result and add `plan-approved` only when the directive is approved.
@@ -70,7 +70,7 @@ Policy:
 
 ## Agent Roles
 
-- **Project Lead** (Manager session) — strategic decisions, requirements, community coordination. Does not write implementation code.
+- **Project Lead** (AI Team Lead session) — strategic decisions, requirements, community coordination. Does not write implementation code.
 - **Proxy Builder** (CC teammate) — implements on feature branches. Commits directive to branch, opens PR, submits for review before implementing.
 - **Codex Review Agent** (external, OpenAI Codex) — independent code reviewer. Reviews on PRs, writes reports to `docs/code-reviews/` in the codex workspace.
 - **Proxy Test Agent** — dedicated integration testing agent. Validates proxy with live CC traffic.
