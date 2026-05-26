@@ -208,6 +208,17 @@ Options (all optional; all fall back to the same env vars used by the CLI):
 
 *The embeddable factory was contributed by [@bilby91](https://github.com/bilby91) at [Crunchloop DAP](https://dap.crunchloop.ai) — see [PR #123](https://github.com/cnighswonger/claude-code-cache-fix/pull/123).*
 
+## What this proxy defends against
+
+**Cache-economics regressions.** The original purpose of cache-fix is to absorb the cache-handling behaviors in Claude Code that cost users real money and quota — TTL downgrades, cache-breaking header churn, identity-latching issues, and the rest of the regression catalog documented across our issue history. The proxy sits between CC and the Anthropic API, normalizes the request and response stream, and emits enough observability (via statusline integration and the quota-status files) that users can see what their session is actually doing. This is the load-bearing feature for almost every user today.
+
+**Bootstrap-channel observability.** Claude Code v2.1.150 introduced a prompt-section consumer that fetches a server-supplied string from `/api/claude_cli/bootstrap` and merges it into the agent's behavioral-instructions prompt path. We filed this behavior with Anthropic's security team in May 2026; Anthropic closed the report as *Informative*, treating TLS as the transport-integrity boundary and declining to add application-layer authenticity checks. Cache-fix v3.6.3 adds explicit handling for this path. Default mode is `audit` — bootstrap responses proxy through to CC and are logged to `~/.claude/cache-fix-bootstrap-log.jsonl` so users can inspect them locally. To opt into block mode instead, set `CACHE_FIX_BOOTSTRAP_MODE=block` in the proxy environment; block mode short-circuits the upstream call and returns a 200 with an empty JSON body, dropping bootstrap content before it reaches CC. (Note: cache-fix v3.6.2 and earlier returned 404 for this path because the proxy router did not include it — the practical effect was that bootstrap content was not previously reaching CC for cache-fix users. v3.6.3's default `audit` changes that behavior; explicit `CACHE_FIX_BOOTSTRAP_MODE=block` preserves it.) The full disclosure record, including Anthropic's verbatim close text, is in [`docs/disclosure/heron-brook-2026-05.md`](docs/disclosure/heron-brook-2026-05.md).
+
+**Reference material:**
+- [`docs/disclosure/heron-brook-2026-05.md`](docs/disclosure/heron-brook-2026-05.md) — full disclosure record
+- [`CHANGELOG.md`](CHANGELOG.md#363---2026-05-26) — v3.6.3 release entry (includes the behavior-change note for prior users)
+- [`cnighswonger/heron-brook-poc`](https://github.com/cnighswonger/heron-brook-poc) — reproducer for the bootstrap-channel behavior
+
 ## Recommended CC operational config
 
 The proxy fixes what it can fix at the request layer. A handful of CC client-side env vars and `~/.claude/settings.json` knobs solve adjacent problems the proxy can't reach — silent model swaps on CC update, ambiguous model fallback, schema-strip side effects. Surfacing these here as a recommendation; users decide their own config.
