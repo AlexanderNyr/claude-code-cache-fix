@@ -1,6 +1,6 @@
 # heron_brook bootstrap channel — disclosure record (2026-05)
 
-This page documents a security disclosure we filed against Claude Code v2.1.150, Anthropic's disposition, and what this proxy ships in response. It exists so that users of cache-fix can see — in primary-source form — the reasoning behind the bootstrap-audit feature added in v3.6.3.
+This page documents a security disclosure we filed against Claude Code v2.1.150, Anthropic's disposition, and what this proxy ships in response. It exists so that users of cache-fix can see — in primary-source form — the reasoning behind the bootstrap-audit feature added in v3.7.0.
 
 ## What was filed
 
@@ -24,7 +24,7 @@ The position is internally consistent: TLS is the integrity boundary, no applica
 
 Users who want visibility into bootstrap-channel content — independent of whether they accept the TLS-boundary framing — now have a defense layer they can run locally:
 
-- **cache-fix v3.6.3** adds bootstrap-response audit logging at `~/.claude/cache-fix-bootstrap-log.jsonl` (5 MB cap, `.1` rotation). Default mode is `audit`; users who want to drop bootstrap responses entirely can opt into block mode by setting `CACHE_FIX_BOOTSTRAP_MODE=block` in the proxy environment. See the [CHANGELOG entry](../../CHANGELOG.md) for v3.6.3 for the feature surface, and the README's *"What this proxy defends against"* section for the operational story.
+- **cache-fix v3.7.0** adds bootstrap-response audit logging at `~/.claude/cache-fix-bootstrap-log.jsonl` (5 MB cap, `.1` rotation). Default mode is `audit`; users who want to drop bootstrap responses entirely can opt into block mode by setting `CACHE_FIX_BOOTSTRAP_MODE=block` in the proxy environment. See the [CHANGELOG entry](../../CHANGELOG.md) for v3.7.0 for the feature surface, and the README's *"What this proxy defends against"* section for the operational story.
 
 - **Proof-of-concept repository:** [`cnighswonger/heron-brook-poc`](https://github.com/cnighswonger/heron-brook-poc) contains the wire-level reproducer and evidence log referenced in the HackerOne submission.
 

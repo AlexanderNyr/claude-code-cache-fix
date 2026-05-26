@@ -91,7 +91,7 @@ Annotated tags only (`-a`), not lightweight tags. The tag message can mirror the
 
 ### 8. npm publish
 
-**No dual-tag / legacy channel policy.** We do not maintain a `legacy` (or any other) dist-tag alongside `latest`. When a release introduces a behavior change that prior users may want to opt out of, the opt-out ships as a runtime toggle (env var or config), not as a parallel npm channel. A parallel channel would create an implicit maintenance promise (back-ported security fixes, etc.) that nothing else in the project warrants. (Question raised + closed during v3.6.3 release prep, 2026-05-26.)
+**No dual-tag / legacy channel policy.** We do not maintain a `legacy` (or any other) dist-tag alongside `latest`. When a release introduces a behavior change that prior users may want to opt out of, the opt-out ships as a runtime toggle (env var or config), not as a parallel npm channel. A parallel channel would create an implicit maintenance promise (back-ported security fixes, etc.) that nothing else in the project warrants. (Question raised + closed during v3.7.0 release prep, 2026-05-26.)
 
 ```bash
 npm publish
