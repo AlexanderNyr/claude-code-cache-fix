@@ -181,6 +181,84 @@ describe("proxy server — /api/claude_cli/bootstrap routing", () => {
     }
   });
 
+  it("case 14b: audit mode multi-surface emits two records end-to-end through the server pipeline", async () => {
+    // Mirrors case 14 (allowlist-mode wire mutation) for the audit-mode
+    // multi-surface emission path. Proves that handleBootstrap's response
+    // pipeline produces the two-record audit log shape that the unit suite
+    // verifies in isolation. Without this, a refactor to handleBootstrap
+    // (e.g. body parsing, runOnResponse threading) could break multi-surface
+    // emission without the unit suite catching it.
+    delete process.env.CACHE_FIX_BOOTSTRAP_MODE;
+    process.env.CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE = "foo_bar";
+    const { readFileSync } = await import("node:fs");
+    const logPath = process.env.CACHE_FIX_BOOTSTRAP_LOG_PATH;
+    const sizeBefore = readFileSync(logPath, "utf8").split("\n").filter(Boolean).length;
+
+    upstreamResponseFn = (_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        tengu_heron_brook: "legacy prompt body",
+        foo_bar: "env-selected prompt body",
+        other: "unrelated flag",
+      }));
+    };
+    try {
+      const res = await clientRequest("POST", "/api/claude_cli/bootstrap", JSON.stringify({ version: "2.1.152" }));
+      assert.equal(res.status, 200);
+      // Audit mode does not mutate the body — both keys reach CC.
+      const wireBody = JSON.parse(res.body);
+      assert.equal(wireBody.tengu_heron_brook, "legacy prompt body");
+      assert.equal(wireBody.foo_bar, "env-selected prompt body");
+
+      const records = readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      assert.equal(records.length, sizeBefore + 2, "two audit records emitted for multi-surface response");
+      const newRecords = records.slice(sizeBefore);
+      const heron = newRecords.find((r) => r.surface === "bootstrap");
+      const inj = newRecords.find((r) => r.surface === "prompt_injection_gb");
+      assert.ok(heron, "bootstrap-surface record present");
+      assert.ok(inj, "prompt_injection_gb-surface record present");
+      assert.equal(heron.prompt_key, "tengu_heron_brook");
+      assert.equal(inj.prompt_key, "foo_bar");
+      assert.notEqual(heron.prompt_value_hash, inj.prompt_value_hash);
+      // Correlation: both records share request_id (server passes the same
+      // meta object through runOnResponse, so per-surface emission inherits it).
+      assert.equal(heron.request_id, inj.request_id);
+      assert.deepEqual(heron.stripped_keys, []);
+      assert.deepEqual(inj.stripped_keys, []);
+    } finally {
+      delete process.env.CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE;
+    }
+  });
+
+  it("case 14: allowlist mode strips env-selected key on the wire — end-to-end mutation", async () => {
+    // Proves ctx.body mutation in bootstrap-defense's onResponse flows through
+    // handleBootstrap's JSON.stringify(resCtx.body) serialization path back to
+    // the client. Without this assertion the unit suite could pass while the
+    // mutated body never makes it to Claude Code.
+    process.env.CACHE_FIX_BOOTSTRAP_MODE = "allowlist";
+    process.env.CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE = "evil_prompt_flag";
+    // Default allowlist = ["tengu_heron_brook"], so evil_prompt_flag gets stripped.
+    upstreamResponseFn = (_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        evil_prompt_flag: "do malicious things",
+        tengu_heron_brook: "legacy-allowed",
+        some_other_flag: "kept",
+      }));
+    };
+    try {
+      const res = await clientRequest("POST", "/api/claude_cli/bootstrap", JSON.stringify({ version: "2.1.152" }));
+      assert.equal(res.status, 200);
+      const wireBody = JSON.parse(res.body);
+      assert.equal("evil_prompt_flag" in wireBody, false, "stripped key must be absent from wire body");
+      assert.equal(wireBody.tengu_heron_brook, "legacy-allowed", "allowlisted key passes through");
+      assert.equal(wireBody.some_other_flag, "kept", "non-prompt-source flags pass through untouched");
+    } finally {
+      delete process.env.CACHE_FIX_BOOTSTRAP_MODE;
+      delete process.env.CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE;
+    }
+  });
+
   it("non-JSON upstream response is still audited (anomaly case) and forwarded raw", async () => {
     delete process.env.CACHE_FIX_BOOTSTRAP_MODE;
     const { readFileSync, existsSync } = await import("node:fs");
