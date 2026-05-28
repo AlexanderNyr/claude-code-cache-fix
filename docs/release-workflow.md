@@ -10,12 +10,27 @@ The project is in **maintenance mode** as of 2026-05-03 (see `~/.claude/memory/s
 
 | Type | Semver bump | When | Authority |
 |------|-------------|------|-----------|
-| **Patch** (bugfix) | x.y.**Z** | Bug fixes only, no API changes, no new env vars, no new behavior | Proxy Builder ships autonomously after Codex review |
-| **Minor** (feature) | x.**Y**.0 | New extension, new env var, new opt-in behavior — backward-compatible | AI Team Lead approves the directive scope before implementation begins; Proxy Builder ships the release |
+| **Patch** (bugfix) | x.y.**Z** | Bug fixes only, no API changes, no new env vars, no new behavior. Also: **security-extension patches** — narrowly-scoped hardening of an existing feature against a newly-disclosed threat that fits the existing feature's threat class, with defaults unchanged and any new env vars / modes opt-in only (see "Security-extension carve-out" below) | Proxy Builder ships autonomously after Codex review |
+| **Minor** (feature) | x.**Y**.0 | New extension, new env var, new opt-in behavior — backward-compatible. Excludes the security-extension carve-out above | AI Team Lead approves the directive scope before implementation begins; Proxy Builder ships the release |
 | **Major** (breaking) | **X**.0.0 | Removed/renamed env vars, changed default behavior, removed extensions, breaking output format changes | Chris's explicit go required before tagging |
 | **Hotfix** (security or critical regression) | x.y.**Z** | Production-impacting issues that can't wait | Proxy Builder ships immediately, notifies AI Team Lead and Chris after |
 
 The maintenance-mode gate sits at the **directive stage** for minor/major releases, not at the release stage. By the time you're cutting the release, the scope question has already been answered.
+
+### Security-extension carve-out (when patch covers something that looks like minor)
+
+A release qualifies for **patch** even when it adds an env var or an opt-in mode, IF ALL of the following hold:
+
+1. **Same feature.** The new code is contained within an existing shipped extension (or the existing extension's module surface), not a new top-level capability.
+2. **Same threat class.** The newly-covered surface fits the threat the existing feature already defends against — same delivery channel, same defensive mechanic, same logging surface. The release is closing a gap in coverage, not expanding the feature's defensive remit.
+3. **Defaults unchanged.** Users running the prior version's defaults get expanded coverage on upgrade, not a new behavior class. Any new env vars and modes are opt-in.
+4. **Directive explicitly scopes the release as patch.** The directive-stage review (AI Team Lead + Codex) endorsed patch scope before implementation began, with the carve-out rationale on record.
+
+If all four hold, the new env vars + opt-in modes are additive hardening rather than feature growth, and patch is appropriate. If any condition fails — especially #3 (defaults change) or #4 (no directive endorsement of patch scope) — the release is minor.
+
+**Precedent: v3.7.1 (2026-05-28).** Extended `bootstrap-defense` from v3.7.0's `tengu_heron_brook` surface to also cover CC v2.1.152's env-var-selected GrowthBook prompt-injection surface. New env var `CACHE_FIX_BOOTSTRAP_ALLOWED_KEYS` and new opt-in mode `CACHE_FIX_BOOTSTRAP_MODE=allowlist` shipped, but defaults unchanged from v3.7.0 (audit). Directive (#153) endorsed patch with explicit rationale; AI Team Lead and Codex approved at directive stage; carve-out applies.
+
+The rationale for the carve-out is that closing a coverage gap in an existing defense is operationally indistinguishable from a security patch for the users who are already running that defense — they expect the feature to keep pace with the surface it defends. Forcing a minor bump on those releases would penalize the defense's existing users with a version-jump signal that misrepresents what changed.
 
 ---
 
