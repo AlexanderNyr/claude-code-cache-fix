@@ -155,6 +155,21 @@ The cold rebuild consumed ~15% Q5h in one call on our Max 5x account. After that
 
 **Total cost of a manual compact cycle:** roughly ~15% cold rebuild plus a few % for the Opus summarization. Compare to hitting the 1M wall and losing the session entirely.
 
+### Stale transcripts get swept (CC's `cleanupPeriodDays`)
+
+Heads up if you're treating the on-disk `.jsonl` as a "keep just in case" backup after `/clear`: it isn't durable. Claude Code maintains a transcript-retention setting `cleanupPeriodDays` in `~/.claude/settings.json` (default 30 days). CC runs a transcript cleanup at startup when its `~/.claude/.last-cleanup` sentinel is past the 24h freshness window — when that fires, CC walks every `.jsonl` under `~/.claude/projects/` and deletes any whose `mtime` is past the cutoff, along with the matching `<session-id>/` companion directory next to it. A session you compacted, `/clear`-ed, and stopped retaining ~31 days ago will be gone after the next launch that crosses the cleanup gate, even if you'd planned to grep it for context.
+
+Practical implications:
+
+- **If you need the post-compact JSONL preserved**, copy it out of `~/.claude/projects/` to a path that isn't subject to CC's cleanup — e.g. `~/snapshots/cc-jsonl-backups/`.
+- **A stopped session held in heal-and-await state is especially vulnerable** — it's idle by definition, so it crosses `cleanupPeriodDays` faster than an actively-used session whose appends keep mtime fresh. If you've stopped a session intending to resume later, either resume promptly, `touch` the `.jsonl` to refresh mtime, or copy it out of the tree.
+- Cleanup keys off `mtime`, and plain reads (`cat`/`grep`/`less`) don't refresh `mtime` — inspection doesn't extend retention.
+- **Raise the retention setting on every machine you use CC on.** Adding `"cleanupPeriodDays": 36500` (~100 years) to `~/.claude/settings.json` defangs the documented cleanup path entirely. There's no documented upper bound; the schema just wants a positive integer. The cleanup logic re-reads the setting at each sweep, so you can land this even on machines where prior sweeps already happened.
+
+**If a transcript was already swept** and you need to recover it, [`vsits/restore-claude-history-linux`](https://github.com/vsits/restore-claude-history-linux) (RCB) restores deleted `.jsonl` files from Linux filesystem snapshots — **ZFS**, **Btrfs**, or **Timeshift**. End-to-end-verified on Ubuntu 24.04; a real Btrfs dogfood confirmed a recovered transcript loads and resumes via `/resume` in a fresh CC session. macOS users have the same shape via the upstream [`garrettmoss/restore-claude-history`](https://github.com/garrettmoss/restore-claude-history) (Time Machine). Both tools also remind you to set `cleanupPeriodDays` afterward — otherwise the restored transcript gets re-swept on the next cleanup pass.
+
+Tracked upstream as [anthropics/claude-code#62272](https://github.com/anthropics/claude-code/issues/62272) — cache-fix doesn't touch this surface, but documenting it because manual-compact users are the population most likely to bank on the `.jsonl` sticking around.
+
 ### Summarizer model
 
 The tool defaults to `claude --print --model claude-opus-4-7` for the highest-fidelity summary. Override with the `MANUAL_COMPACT_MODEL` env var — e.g. `MANUAL_COMPACT_MODEL=claude-sonnet-4-6` to minimize Q5h impact, or to point at a different model if Opus is rate-limited or retired.
