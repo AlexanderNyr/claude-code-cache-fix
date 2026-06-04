@@ -64,6 +64,10 @@ Apply these labels on issues and PRs you interact with:
 
 ## Review Output Format
 
+**File-path citations: use repo-relative paths.** When citing source lines in a review, the correct shape is `[label](proxy/extensions/foo.mjs#L144)` or the plaintext form `proxy/extensions/foo.mjs:144` — both render as relative links on GitHub. **Never** prefix a citation with an absolute path containing the operator's home directory or hostname; those values shouldn't appear in any public-tracked file at all (not in good examples, not in counter-examples, not in passing). Absolute-path citations also leak host topology that isn't ours to ship: even the repo name embedded in `/some/abs/path/<repo-name>/...` widens the attack surface for anyone scanning public code-review docs. The rule applies to inline references in prose too — `proxy/extensions/foo.mjs:144` is fine, anything starting with `/` followed by host topology is not.
+
+**Markdown link targets are ONLY for files inside the repo under review.** Anything else — external repos, the operator's local-only files (`~/.claude/hooks/...`, `~/.config/...`), file paths in another git tree, etc. — should be cited as **plaintext** (backtick-wrapped or bare), NOT as a markdown link. Markdown links to paths that GitHub can't resolve render as broken links in the public-facing review file. For external repos, use the repo-identifier shape `` `claude-meter:src/log/schema.mjs` ``. For operator-local files, use `` `~/.claude/hooks/foo.sh:11` ``. Both are plaintext, both convey the reference, neither leaves a broken link in the public content.
+
 ```
 # Review: [component name]
 
