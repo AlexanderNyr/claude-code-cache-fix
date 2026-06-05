@@ -112,6 +112,48 @@ test("renderLaunchdTemplate: omits CACHE_FIX_PROXY_UPSTREAM/DEBUG when not set",
   assert.ok(!out.includes("CACHE_FIX_DEBUG"));
 });
 
+// #196 / #198: CACHE_FIX_HOT_RELOAD env-capture rendering. install-service
+// reads CACHE_FIX_HOT_RELOAD from the env at install time and bakes it into
+// the generated unit/plist when set to the literal "on", omits the slot
+// entirely otherwise. Matches the existing PORT/UPSTREAM/DEBUG precedent.
+
+test("renderSystemdTemplate: omits CACHE_FIX_HOT_RELOAD when not set", async () => {
+  const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
+  const out = renderSystemdTemplate(tpl, sampleVars);
+  assert.ok(!out.includes("CACHE_FIX_HOT_RELOAD"));
+});
+
+test("renderSystemdTemplate: includes CACHE_FIX_HOT_RELOAD=on when set", async () => {
+  const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
+  const out = renderSystemdTemplate(tpl, { ...sampleVars, hotReload: "on" });
+  assert.ok(out.includes("Environment=CACHE_FIX_HOT_RELOAD=on"));
+});
+
+test("renderLaunchdTemplate: omits CACHE_FIX_HOT_RELOAD when not set", async () => {
+  const tpl = await readFile(
+    join(TEMPLATE_DIR, "com.cnighswonger.cache-fix-proxy.plist.template"),
+    "utf-8",
+  );
+  const out = renderLaunchdTemplate(tpl, { ...sampleVars, logDir: "/tmp/logs" });
+  assert.ok(!out.includes("CACHE_FIX_HOT_RELOAD"));
+});
+
+test("renderLaunchdTemplate: includes CACHE_FIX_HOT_RELOAD=on when set", async () => {
+  const tpl = await readFile(
+    join(TEMPLATE_DIR, "com.cnighswonger.cache-fix-proxy.plist.template"),
+    "utf-8",
+  );
+  const out = renderLaunchdTemplate(tpl, {
+    ...sampleVars,
+    logDir: "/tmp/logs",
+    hotReload: "on",
+  });
+  assert.ok(out.includes("<key>CACHE_FIX_HOT_RELOAD</key>"));
+  assert.ok(out.includes("<string>on</string>"));
+  // Plist must remain well-formed: no stray template tags.
+  assert.ok(!out.includes("{{"));
+});
+
 // --- Port validation (shell-injection guard) ---
 
 test("validatePort: accepts valid numeric strings", () => {
@@ -235,6 +277,111 @@ test("installSystemd: writes file to configDir; uninstall removes it", async () 
     assert.ok(r2.ok);
     const files = await readdir(dir);
     assert.deepEqual(files, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// #196 / #198 end-to-end: installSystemd / installLaunchd must thread the
+// hotReload field through to the on-disk unit / plist. Earlier rounds of
+// this change tested only the renderer helpers and missed this path.
+
+test("installSystemd: hotReload from defaults reaches the written file", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    const r = await installSystemd({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", hotReload: "on", workingDir: "/tmp" },
+    });
+    assert.ok(r.ok);
+    const onDisk = await readFile(join(dir, "cache-fix-proxy.service"), "utf-8");
+    assert.ok(
+      onDisk.includes("Environment=CACHE_FIX_HOT_RELOAD=on"),
+      "installSystemd must write the CACHE_FIX_HOT_RELOAD=on Environment= line when defaults.hotReload is 'on'",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installSystemd: hotReload empty/unset omits the line from the written file", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    const r = await installSystemd({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", hotReload: "", workingDir: "/tmp" },
+    });
+    assert.ok(r.ok);
+    const onDisk = await readFile(join(dir, "cache-fix-proxy.service"), "utf-8");
+    assert.ok(
+      !onDisk.includes("CACHE_FIX_HOT_RELOAD"),
+      "installSystemd must NOT write a CACHE_FIX_HOT_RELOAD line when defaults.hotReload is empty",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installLaunchd: hotReload from defaults reaches the written plist", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "launchd",
+      configDir: dir,
+      configFile: "com.cnighswonger.cache-fix-proxy.plist",
+      label: "com.cnighswonger.cache-fix-proxy",
+      logDir: "/tmp/logs",
+    };
+    const r = await installLaunchd({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", hotReload: "on", workingDir: "/tmp" },
+    });
+    assert.ok(r.ok);
+    const onDisk = await readFile(join(dir, "com.cnighswonger.cache-fix-proxy.plist"), "utf-8");
+    assert.ok(
+      onDisk.includes("<key>CACHE_FIX_HOT_RELOAD</key>"),
+      "installLaunchd must write the CACHE_FIX_HOT_RELOAD key into the plist when defaults.hotReload is 'on'",
+    );
+    assert.ok(onDisk.includes("<string>on</string>"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installLaunchd: hotReload empty/unset omits the key from the written plist", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "launchd",
+      configDir: dir,
+      configFile: "com.cnighswonger.cache-fix-proxy.plist",
+      label: "com.cnighswonger.cache-fix-proxy",
+      logDir: "/tmp/logs",
+    };
+    const r = await installLaunchd({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", hotReload: "", workingDir: "/tmp" },
+    });
+    assert.ok(r.ok);
+    const onDisk = await readFile(join(dir, "com.cnighswonger.cache-fix-proxy.plist"), "utf-8");
+    assert.ok(
+      !onDisk.includes("CACHE_FIX_HOT_RELOAD"),
+      "installLaunchd must NOT write a CACHE_FIX_HOT_RELOAD key when defaults.hotReload is empty",
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
