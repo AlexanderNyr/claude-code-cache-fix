@@ -238,8 +238,11 @@ export default {
           // 590, stashes these before this writer runs). Optional — absent if
           // that extension is disabled or produced nothing this request.
           ...(ctx.meta._sessionHealth || {}),
-          // Additive thinking-block-sanitize drop count (order 550, opt-in).
-          // Optional — absent unless CACHE_FIX_THINKING_SANITIZE=on.
+          // Additive thinking-block-sanitize drop count (order 550). On by
+          // default since v4.0.0; present (possibly with thinking_blocks_dropped:0)
+          // whenever sanitize ran. Absent when CACHE_FIX_THINKING_SANITIZE=off
+          // or when the extension returned early before reaching the planner
+          // (e.g., body.messages not an array).
           ...(ctx.meta._thinkingSanitize || {}),
           // Additive thinking-block-sanitize v2 fields (order 550, opt-in via
           // CACHE_FIX_THINKING_SANITIZE=v2). Optional — absent unless v2 is
