@@ -6,6 +6,47 @@ import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
 
+// Debug logging — writes to ~/.claude/cache-fix-debug.log (override path with
+// CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
+// Env is read on every call so tests (and operators flipping the flag at
+// runtime) see live behavior — same pattern as image-strip's #98 gate.
+import { appendFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import util from "node:util";
+
+function debugLogPath() {
+  return process.env.CACHE_FIX_DEBUG_LOG ||
+    join(homedir(), ".claude", "cache-fix-debug.log");
+}
+
+// Never spread raw headers to the log: Authorization / x-api-key / cookies
+// must never persist to disk. Same discipline as bootstrap-defense.mjs's
+// audit-record contract — extract named scalars only.
+const SENSITIVE_HEADERS = new Set([
+  "authorization",
+  "x-api-key",
+  "cookie",
+  "set-cookie",
+  "proxy-authorization",
+]);
+
+function redactHeaders(headers) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers || {})) {
+    out[k] = SENSITIVE_HEADERS.has(k.toLowerCase()) ? "[REDACTED]" : v;
+  }
+  return out;
+}
+
+function debugLog(...args) {
+  if (process.env.CACHE_FIX_DEBUG !== "1") return;
+  const path = debugLogPath();
+  try { mkdirSync(dirname(path), { recursive: true }); } catch {}
+  const line = `[${new Date().toISOString()}] ${util.format(...args)}\n`;
+  try { appendFileSync(path, line); } catch {}
+}
+
 function collectBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -74,7 +115,13 @@ async function handleMessages(clientReq, clientRes) {
   });
 
   const pre = await preForward(clientReq, clientRes, abortController, extSnapshot, "messages");
-  if (pre.handled) return;
+  if (pre.handled) {
+    debugLog("[PROXY] handled internally without upstream request",
+             "method:", clientReq.method, "url:", clientReq.url,
+             "status:", clientRes.statusCode,
+             "response headers:", redactHeaders(clientRes.getHeaders()));
+    return;
+  }
   const { parsed, forwardBody, meta } = pre;
 
   const requestedModel = parsed?.model || null;
@@ -88,6 +135,7 @@ async function handleMessages(clientReq, clientRes) {
       abortController.signal
     ));
   } catch (err) {
+    debugLog("[PROXY] forwardRequest error:", err.message);
     if (abortController.signal.aborted) return;
     clientRes.writeHead(502, { "content-type": "application/json" });
     clientRes.end(JSON.stringify({ error: "upstream_error", message: err.message }));
@@ -98,6 +146,11 @@ async function handleMessages(clientReq, clientRes) {
   // (rate-limit-log, future per-connection diagnostics) can record which
   // socket carried the request without each one re-instrumenting upstream.
   meta._upstreamConnectionId = upstreamConnectionId ?? null;
+
+  debugLog("[UPSTREAM -> PROXY -> CLAUDE] RESPONSE",
+           "status:", statusCode, "message:", upstreamRes.statusMessage,
+           "upstream headers:", redactHeaders(upstreamRes.headers),
+           "proxy headers:", redactHeaders(responseHeaders));
 
   if (extSnapshot.length > 0) {
     const resCtx = { status: statusCode, headers: responseHeaders, meta };
@@ -274,16 +327,44 @@ function handleNotFound(_req, res) {
  */
 export function createProxyServer() {
   return http.createServer((req, res) => {
-    if (req.method === "GET" && req.url === "/health") {
-      return handleHealth(req, res);
-    }
-    if (req.method === "POST" && req.url?.startsWith("/v1/messages")) {
-      return handleMessages(req, res);
-    }
-    if (req.url?.startsWith("/api/claude_cli/bootstrap")) {
-      return handleBootstrap(req, res);
-    }
-    handleNotFound(req, res);
+    // Async IIFE: handleMessages/handleBootstrap return promises, so we have
+    // to await them inside the try/catch — a bare return would let rejections
+    // escape to unhandledRejection and (on Node 15+) crash the process.
+    (async () => {
+      try {
+        debugLog("[CLAUDE -> PROXY] REQUEST",
+                 "method:", req.method, "url:", req.url,
+                 "headers:", redactHeaders(req.headers));
+
+        // Wrap res.write/res.end to log chunk-level activity when debug is on.
+        // These are sync monkey-patches; the inner debugLog self-gates so the
+        // overhead is negligible when CACHE_FIX_DEBUG is unset.
+        const originalWrite = res.write;
+        const originalEnd = res.end;
+        res.write = function (chunk, ...args) {
+          debugLog(`[PROXY -> CLAUDE] Send chunk. Size: ${chunk ? chunk.length : 0} bytes`);
+          return originalWrite.apply(res, [chunk, ...args]);
+        };
+        res.end = function (chunk, ...args) {
+          debugLog("[PROXY -> CLAUDE] Close connection (res.end)");
+          return originalEnd.apply(res, [chunk, ...args]);
+        };
+
+        if (req.method === "GET" && req.url === "/health") return handleHealth(req, res);
+        if (req.method === "POST" && req.url?.startsWith("/v1/messages")) return await handleMessages(req, res);
+        if (req.url?.startsWith("/api/claude_cli/bootstrap")) return await handleBootstrap(req, res);
+        debugLog("ERROR: handler not found for req.url=", req.url, "method=", req.method);
+        handleNotFound(req, res);
+      } catch (error) {
+        debugLog("REQUEST HANDLER ERROR:", error?.message, error?.stack);
+        // Generic body: do NOT echo error.message (may include internal paths,
+        // upstream URLs, or other server state).
+        if (!res.headersSent) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "internal_proxy_error" }));
+        }
+      }
+    })();
   });
 }
 
