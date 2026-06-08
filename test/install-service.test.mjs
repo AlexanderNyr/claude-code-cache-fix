@@ -38,6 +38,8 @@ const sampleVars = {
   serverPath: "/opt/cache-fix/proxy/server.mjs",
   port: "9801",
   upstream: "",
+  caFile: "",
+  rejectUnauthorized: "",
   debug: "",
   workingDir: "/opt/cache-fix",
   requires: "",
@@ -58,20 +60,26 @@ test("renderSystemdTemplate: omits empty optional Environment lines", async () =
   const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
   const out = renderSystemdTemplate(tpl, sampleVars);
   assert.ok(!out.includes("CACHE_FIX_PROXY_UPSTREAM"));
+  assert.ok(!out.includes("CACHE_FIX_PROXY_CA_FILE"));
+  assert.ok(!out.includes("CACHE_FIX_PROXY_REJECT_UNAUTHORIZED"));
   assert.ok(!out.includes("CACHE_FIX_DEBUG"));
   // No leftover empty placeholders
   assert.ok(!out.includes("{{"));
   assert.ok(!out.includes("}}"));
 });
 
-test("renderSystemdTemplate: includes UPSTREAM and DEBUG when set", async () => {
+test("renderSystemdTemplate: includes UPSTREAM, CA_FILE, REJECT_UNAUTHORIZED and DEBUG when set", async () => {
   const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
   const out = renderSystemdTemplate(tpl, {
     ...sampleVars,
     upstream: "http://127.0.0.1:8080",
+    caFile: "/etc/ssl/ca \" file.pem", // with space and "
+    rejectUnauthorized: "0",
     debug: "1",
   });
   assert.ok(out.includes("Environment=CACHE_FIX_PROXY_UPSTREAM=http://127.0.0.1:8080"));
+  assert.ok(out.includes("Environment=CACHE_FIX_PROXY_CA_FILE=\"/etc/ssl/ca \\\" file.pem\""));
+  assert.ok(out.includes("Environment=CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=0"));
   assert.ok(out.includes("Environment=CACHE_FIX_DEBUG=1"));
 });
 
@@ -80,6 +88,40 @@ test("renderSystemdTemplate: requires line wires both Requires and After", async
   const out = renderSystemdTemplate(tpl, { ...sampleVars, requires: "llm-relay.service" });
   assert.ok(out.includes("Requires=llm-relay.service"));
   assert.ok(out.includes("After=llm-relay.service"));
+});
+
+// PR #189 regression — bare % triggers systemd specifier expansion and
+// silently drops the variable. Verified 2026-06-07 against `systemctl --user`:
+// the unit line `Environment=X=a%%20b` delivers `a%20b` to the spawned
+// process, while `Environment=X=a%20b` (unescaped) delivers an empty string
+// after a "Failed to resolve specifiers ... Invalid slot" log entry.
+test("renderSystemdTemplate: bare % in upstream URL is escaped to %% (PR #189)", async () => {
+  const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
+  const out = renderSystemdTemplate(tpl, {
+    ...sampleVars,
+    upstream: "http://10.0.0.1:8080/path%20with%20encoded",
+  });
+  assert.ok(
+    out.includes("Environment=CACHE_FIX_PROXY_UPSTREAM=http://10.0.0.1:8080/path%%20with%%20encoded"),
+    "bare % must be escaped to %% in the rendered Environment= line",
+  );
+  assert.ok(!/=http:\/\/10\.0\.0\.1:8080\/path%20/.test(out), "no unescaped %20 should appear");
+});
+
+// PR #189 regression — bare \ triggers systemd C-string unescape and
+// produces a control byte. Verified 2026-06-07: `Environment=X=/path/with\backslash.pem`
+// delivers /path/with<0x08>ackslash.pem to the process; the quoted form
+// `Environment=X="/path/with\\backslash.pem"` delivers the literal value.
+test("renderSystemdTemplate: backslash in CA file path is escaped to \\\\ (PR #189)", async () => {
+  const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
+  const out = renderSystemdTemplate(tpl, {
+    ...sampleVars,
+    caFile: "/etc/ssl/with\\backslash.pem",
+  });
+  assert.ok(
+    out.includes('Environment=CACHE_FIX_PROXY_CA_FILE="/etc/ssl/with\\\\backslash.pem"'),
+    "bare \\ must be escaped to \\\\ inside the quoted Environment= value",
+  );
 });
 
 test("renderLaunchdTemplate: substitutes core fields and renders valid plist", async () => {
@@ -99,7 +141,31 @@ test("renderLaunchdTemplate: substitutes core fields and renders valid plist", a
   assert.ok(!out.includes("{{"));
 });
 
-test("renderLaunchdTemplate: omits CACHE_FIX_PROXY_UPSTREAM/DEBUG when not set", async () => {
+test("renderLaunchdTemplate: includes UPSTREAM, CA_FILE, REJECT_UNAUTHORIZED and DEBUG when set", async () => {
+  const tpl = await readFile(
+    join(TEMPLATE_DIR, "com.cnighswonger.cache-fix-proxy.plist.template"),
+    "utf-8",
+  );
+  const out = renderLaunchdTemplate(tpl, {
+    ...sampleVars,
+    upstream: "http://127.0.0.1:8080",
+    caFile: "/etc/ssl/ca & < > ' \" file.pem", // with XLM spec symbols
+    rejectUnauthorized: "0",
+    debug: "1",
+    logDir: "/Users/test/Library/Logs",
+  });
+  assert.ok(out.includes("<string>com.cnighswonger.cache-fix-proxy</string>"));
+  assert.ok(out.includes("<string>/usr/local/bin/node</string>"));
+  assert.ok(out.includes("<string>/opt/cache-fix/proxy/server.mjs</string>"));
+  assert.ok(out.includes("<string>9801</string>"));
+  assert.ok(out.includes("<string>http://127.0.0.1:8080</string>"));
+  assert.ok(out.includes("<string>/etc/ssl/ca &amp; &lt; &gt; &apos; &quot; file.pem</string>"));
+  assert.ok(out.includes("<string>0</string>"));
+  assert.ok(out.includes("<string>/Users/test/Library/Logs/cache-fix-proxy.log</string>"));
+  assert.ok(!out.includes("{{"));
+});
+
+test("renderLaunchdTemplate: omits CACHE_FIX_PROXY_UPSTREAM/CA_FILE/REJECT_UNAUTHORIZED/DEBUG when not set", async () => {
   const tpl = await readFile(
     join(TEMPLATE_DIR, "com.cnighswonger.cache-fix-proxy.plist.template"),
     "utf-8",
@@ -109,6 +175,8 @@ test("renderLaunchdTemplate: omits CACHE_FIX_PROXY_UPSTREAM/DEBUG when not set",
     logDir: "/tmp/logs",
   });
   assert.ok(!out.includes("CACHE_FIX_PROXY_UPSTREAM"));
+  assert.ok(!out.includes("CACHE_FIX_PROXY_CA_FILE"));
+  assert.ok(!out.includes("CACHE_FIX_PROXY_REJECT_UNAUTHORIZED"));
   assert.ok(!out.includes("CACHE_FIX_DEBUG"));
 });
 
@@ -268,10 +336,12 @@ test("installSystemd: writes file to configDir; uninstall removes it", async () 
       healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
       healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
     };
-    const r1 = await installSystemd({ paths, defaults: { port: "9999", upstream: "", debug: "", workingDir: "/tmp" } });
+    const r1 = await installSystemd({ paths, defaults: { port: "9999", upstream: "", caFile: "/etc/ssl/ca.pem", rejectUnauthorized: "0", debug: "", workingDir: "/tmp" } });
     assert.ok(r1.ok);
     const onDisk = await readFile(join(dir, "cache-fix-proxy.service"), "utf-8");
     assert.ok(onDisk.includes("CACHE_FIX_PROXY_PORT=9999"));
+    assert.ok(onDisk.includes("CACHE_FIX_PROXY_CA_FILE=/etc/ssl/ca.pem"));
+    assert.ok(onDisk.includes("CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=0"));
 
     const r2 = await uninstallSystemd({ paths });
     assert.ok(r2.ok);
