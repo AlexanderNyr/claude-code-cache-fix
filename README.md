@@ -60,6 +60,8 @@ How it works: the proxy also handles HTTP `CONNECT`. It MITMs **only** the upstr
 
 Corporate proxy chaining works the same as reverse mode: set `HTTPS_PROXY`/`HTTP_PROXY` for the proxy's **own** upstream egress (the proxy dials `api.anthropic.com` through it). The client's `HTTPS_PROXY` points at the cache-fix proxy; the cache-fix proxy's `HTTPS_PROXY` (in its own env) points at the corporate proxy.
 
+**Crash semantics on a shared proxy.** In forward-proxy mode the proxy MITMs the whole upstream host, so an in-flight Claude Code session is wired to *this* port and cannot fail over. To keep one bad request from taking the process down, a successful forward-proxy attach installs process-wide `uncaughtException`/`unhandledRejection` handlers that log and keep serving instead of crashing. These are scoped to forward mode (a reverse-only proxy keeps Node's default crash-on-uncaught semantics, letting its supervisor restart it) and are removed when the last forward instance closes. The tradeoff: on a **shared / multi-tenant** proxy, enabling forward mode changes crash behavior for every client on that instance while the mode is on — a fatal bug is swallowed rather than surfaced to a supervisor. If you run one proxy for many sessions, weigh that against a supervised per-session model.
+
 **Running it persistently.** The `... node .../proxy/server.mjs &` above is fine for a quick try, but a backgrounded process is not supervised: it does not restart if it crashes or if the machine reboots. To run forward-proxy mode as a managed service (auto-restart, start-on-login), use the same `install-service` path described under [Running as a service](#running-as-a-service) — just set the flag at install time so it is baked into the unit:
 
 ```bash
