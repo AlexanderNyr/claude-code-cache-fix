@@ -371,6 +371,13 @@ async function handlePassthrough(clientReq, clientRes) {
     }
     return;
   }
+  // Success-path trace (gated on CACHE_FIX_DEBUG=1, no-op otherwise). Forward
+  // mode relays every non-transformed path — RC credential fetches, OAuth,
+  // /api/* — verbatim, and those never touched the pipeline's logging. Without
+  // this line a working RC relay is invisible server-side, so validating RC
+  // required a client in the loop. Method + path + status only; no headers or
+  // body (this path carries credentials — see redactHeaders discipline above).
+  debugLog("[PROXY] passthrough:", method, clientReq.url, "->", statusCode);
   clientRes.writeHead(statusCode, responseHeaders);
   upstreamRes.on("error", () => { if (!clientRes.writableEnded) clientRes.end(); });
   upstreamRes.pipe(clientRes);
