@@ -6,6 +6,7 @@ import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
 import { startOAuthRefresher, stopOAuthRefresher } from "./oauth/refresher.mjs";
+import { attachForwardProxy } from "./forward-proxy.mjs";
 
 // Debug logging — writes to ~/.claude/cache-fix-debug.log (override path with
 // CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
@@ -291,6 +292,19 @@ async function handleBootstrap(clientReq, clientRes) {
   clientRes.end(rawResponse);
 }
 
+// Set true only after attachForwardProxy() actually succeeds. `config
+// .forwardProxy` reflects the REQUESTED mode; this reflects the EFFECTIVE mode.
+// They diverge when forward-proxy was requested but attach failed (e.g. openssl
+// missing so CA generation threw) and we fell back to reverse-proxy. /health
+// reports the effective value so clients/monitoring aren't told forward-proxy
+// is on when it silently isn't.
+// Count of live, successfully-attached forward-proxy instances in this process
+// (embedded/test processes can run several). Routing and /health key on this —
+// NOT on config.forwardProxy — so a requested-but-failed attach serves
+// reverse-mode semantics, and a closed forward instance retires its vote
+// instead of haunting later reverse-only instances in the same process.
+let _forwardActive = 0;
+
 function handleHealth(_req, res) {
   // Surface extension-load failures so callers (operators, monitoring) see
   // a degraded proxy state instead of a misleading "ok". See #196: a Node
@@ -308,12 +322,58 @@ function handleHealth(_req, res) {
     return;
   }
   res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ status: "ok" }));
+  // Surface the outbound proxy the forward-proxy blind-tunnels CONNECTs through
+  // (config.httpsProxy, from HTTPS_PROXY/https_proxy). A supervisor/health probe
+  // can then tell a proxy that came up WITH the expected corp proxy from one that
+  // came up WITHOUT it — a stale instance started without HTTPS_PROXY still
+  // answers forward_proxy:true but silently dials non-MITM hosts directly, which
+  // fails behind a corp firewall. Only meaningful in forward-proxy mode; null
+  // when no outbound proxy is configured.
+  res.end(JSON.stringify({
+    status: "ok",
+    version: config.version,
+    forward_proxy: _forwardActive > 0,
+    https_proxy: (_forwardActive > 0 && config.httpsProxy) || null,
+  }));
 }
 
 function handleNotFound(_req, res) {
   res.writeHead(404, { "content-type": "application/json" });
   res.end(JSON.stringify({ error: "not_found" }));
+}
+
+// Transparent pass-through for forward-proxy mode. When the proxy MITMs the
+// whole upstream host (CACHE_FIX_FORWARD_PROXY=on), it sees EVERY request to
+// api.anthropic.com, not just /v1/messages. Non-transformed paths (Remote
+// Control credential fetch, OAuth, /api/*, ...) must be relayed to upstream
+// untouched; otherwise they'd 404 and break RC ("Remote credentials fetch
+// failed"). No pipeline, no parsing: collect the body (if any), forward it via
+// the same upstream transport (incl. corp-proxy egress), and stream the
+// response straight back. Reverse-proxy mode never reaches this (only
+// /v1/messages arrives there), so its 404 contract is unchanged.
+async function handlePassthrough(clientReq, clientRes) {
+  const abortController = new AbortController();
+  clientReq.on("close", () => { if (!clientRes.writableEnded) abortController.abort(); });
+
+  const method = (clientReq.method || "GET").toUpperCase();
+  const body = (method === "GET" || method === "HEAD") ? null : await collectBody(clientReq);
+
+  let upstreamRes, responseHeaders, statusCode;
+  try {
+    ({ upstreamRes, responseHeaders, statusCode } = await forwardRequest(
+      clientReq, body, abortController.signal));
+  } catch (err) {
+    debugLog("[PROXY] passthrough forwardRequest error:", err.message, "url:", clientReq.url);
+    if (abortController.signal.aborted) return;
+    if (!clientRes.headersSent) {
+      clientRes.writeHead(502, { "content-type": "application/json" });
+      clientRes.end(JSON.stringify({ error: "upstream_error", message: err.message }));
+    }
+    return;
+  }
+  clientRes.writeHead(statusCode, responseHeaders);
+  upstreamRes.on("error", () => { if (!clientRes.writableEnded) clientRes.end(); });
+  upstreamRes.pipe(clientRes);
 }
 
 /**
@@ -354,6 +414,13 @@ export function createProxyServer() {
         if (req.method === "GET" && req.url === "/health") return handleHealth(req, res);
         if (req.method === "POST" && req.url?.startsWith("/v1/messages")) return await handleMessages(req, res);
         if (req.url?.startsWith("/api/claude_cli/bootstrap")) return await handleBootstrap(req, res);
+        // Forward-proxy mode MITMs the whole host, so any other path (RC creds,
+        // OAuth, ...) must be relayed to upstream untouched rather than 404'd.
+        // Keyed on _forwardProxyActive (attach actually succeeded), NOT
+        // config.forwardProxy (the env request): if attachForwardProxy() threw,
+        // the proxy is serving reverse-mode only and must keep that mode's 404
+        // contract instead of silently relaying non-core paths upstream.
+        if (_forwardActive > 0) return await handlePassthrough(req, res);
         debugLog("ERROR: handler not found for req.url=", req.url, "method=", req.method);
         handleNotFound(req, res);
       } catch (error) {
@@ -367,6 +434,34 @@ export function createProxyServer() {
       }
     })();
   });
+}
+
+// The forward-mode self-heal swallowers are process-wide, so they are
+// installed once (ref-counted across instances) and — the part the old
+// env-var guard got wrong — removed again when the last attached forward
+// instance closes. An embedded/shared process that ran forward mode earlier
+// must regain Node's default crash-on-uncaught semantics afterwards, not
+// keep masking fatal bugs for every later run.
+let _selfHealRefs = 0;
+let _selfHealHandlers = null;
+function installSelfHeal() {
+  _selfHealRefs++;
+  if (_selfHealHandlers) return;
+  const onException = (err) => {
+    process.stderr.write(`[cache-fix] self-heal: uncaughtException swallowed (proxy stays up): ${err && err.stack || err}\n`);
+  };
+  const onRejection = (reason) => {
+    process.stderr.write(`[cache-fix] self-heal: unhandledRejection swallowed (proxy stays up): ${reason && reason.stack || reason}\n`);
+  };
+  process.on("uncaughtException", onException);
+  process.on("unhandledRejection", onRejection);
+  _selfHealHandlers = { onException, onRejection };
+}
+function removeSelfHeal() {
+  if (!_selfHealHandlers || --_selfHealRefs > 0) return;
+  process.off("uncaughtException", _selfHealHandlers.onException);
+  process.off("unhandledRejection", _selfHealHandlers.onRejection);
+  _selfHealHandlers = null;
 }
 
 /**
@@ -423,6 +518,29 @@ export async function startProxy(options = {}) {
   } catch {}
 
   const server = createProxyServer();
+
+  // Forward-proxy mode (CACHE_FIX_FORWARD_PROXY=on): also handle CONNECT and
+  // MITM only the upstream host, so the client wires HTTPS_PROXY (not
+  // ANTHROPIC_BASE_URL) and keeps Remote Control. Attached before listen so the
+  // handler is present for the first CONNECT. Failure falls back to
+  // reverse-proxy only rather than preventing the proxy from serving.
+  let forwardProxyCA = null;
+  let forwardAttached = false;
+  if (config.forwardProxy) {
+    try { forwardProxyCA = attachForwardProxy(server); _forwardActive++; forwardAttached = true; }
+    catch (err) { process.stderr.write(`[cache-fix] forward-proxy FAILED (reverse-proxy only): ${err && err.message}\n`); }
+
+    // Self-heal: in forward-proxy mode the proxy MITMs the whole upstream host,
+    // so a stray socket/TLS error or a bug in one request must never take the
+    // process down: an in-flight CC session is wired to THIS port and cannot
+    // fail over. Log and keep serving instead of crashing. Scoped to a
+    // SUCCESSFULLY ATTACHED forward proxy — a failed attach serves reverse-mode
+    // only and must keep Node's default crash-on-uncaught semantics (its
+    // supervisor restarts it), not have them silently swallowed. Removed again
+    // when the last attached instance closes (see installSelfHeal).
+    if (forwardAttached) installSelfHeal();
+  }
+
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, bind, () => {
@@ -444,12 +562,27 @@ export async function startProxy(options = {}) {
   }
 
   const addr = server.address();
+  if (forwardProxyCA) {
+    process.stderr.write(
+      "[cache-fix] forward-proxy: on. Wire the client (leave ANTHROPIC_BASE_URL UNSET so Remote Control stays enabled):\n" +
+      `  export HTTPS_PROXY=http://${addr.address}:${addr.port}\n` +
+      `  export NODE_EXTRA_CA_CERTS=${forwardProxyCA}\n`,
+    );
+  }
+  let closed = false;
   return {
     server,
     port: addr.port,
     address: addr.address,
     close: () =>
       new Promise((resolve, reject) => {
+        // Retire this instance's forward-mode vote exactly once (guarded
+        // against double-close): routing/health stop passthrough behavior and
+        // the process-wide self-heal is removed with the last live instance.
+        if (!closed) {
+          closed = true;
+          if (forwardAttached) { _forwardActive--; removeSelfHeal(); }
+        }
         try { stopOAuthRefresher(); } catch {}
         try {
           if (watcher) watcher.close();
