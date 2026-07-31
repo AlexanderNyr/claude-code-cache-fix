@@ -66,6 +66,19 @@ function collectBody(req) {
 // `routeName` is stashed on ctx.meta.route so route-aware extensions
 // (bootstrap-defense, env-flag-detector) can discriminate without each
 // route needing its own pipeline hook.
+//
+// Returns `headers`: the (possibly extension-mutated) outbound header
+// object. Extensions read/mutate `reqCtx.headers` — added, changed, AND
+// deleted keys — expecting those mutations to reach the real outbound
+// request (auto-1m-guard's strip mode is the standing example). Prior to
+// this fix only `reqCtx.body` was serialized back into `forwardBody`;
+// `reqCtx.headers` was built for extensions to read/mutate but the mutated
+// object was discarded — forwardRequest still read the ORIGINAL
+// `clientReq.headers`, so header mutations never reached the wire.
+// Returning the object itself (not a copy) is what makes deletions visible
+// to the caller too: `{ ...x }` followed by `delete copy.k` naturally drops
+// `k` from the copy, so no special-casing is needed for add/change/delete —
+// plain object semantics carry all three.
 async function preForward(clientReq, clientRes, _abortController, extSnapshot, routeName, baseMeta = {}) {
   const rawBody = await collectBody(clientReq);
 
@@ -77,6 +90,7 @@ async function preForward(clientReq, clientRes, _abortController, extSnapshot, r
   }
 
   let forwardBody = rawBody;
+  let headers = clientReq.headers;
   // baseMeta lets routes pre-populate audit scalars (e.g. resolved upstream
   // hostname, request_id) so they're available to onRequest hooks BEFORE the
   // upstream call — block-mode short-circuits in onRequest, so a post-call
@@ -99,9 +113,10 @@ async function preForward(clientReq, clientRes, _abortController, extSnapshot, r
     if (parsed) {
       forwardBody = Buffer.from(JSON.stringify(reqCtx.body));
     }
+    headers = reqCtx.headers;
   }
 
-  return { handled: false, parsed, forwardBody, meta };
+  return { handled: false, parsed, forwardBody, headers, meta };
 }
 
 async function handleMessages(clientReq, clientRes) {
@@ -124,15 +139,19 @@ async function handleMessages(clientReq, clientRes) {
              "response headers:", redactHeaders(clientRes.getHeaders()));
     return;
   }
-  const { parsed, forwardBody, meta } = pre;
+  const { parsed, forwardBody, headers, meta } = pre;
 
   const requestedModel = parsed?.model || null;
 
   let upstreamRes, responseHeaders, statusCode, upstreamConnectionId;
 
   try {
+    // Forward the (possibly extension-mutated) headers, not clientReq
+    // directly — forwardRequest only reads .url/.method/.headers off its
+    // first argument, so a minimal wrapper carrying the mutated headers is
+    // sufficient and avoids touching upstream.mjs's signature.
     ({ upstreamRes, responseHeaders, statusCode, upstreamConnectionId } = await forwardRequest(
-      clientReq,
+      { url: clientReq.url, method: clientReq.method, headers },
       forwardBody,
       abortController.signal
     ));
@@ -234,13 +253,15 @@ async function handleBootstrap(clientReq, clientRes) {
 
   const pre = await preForward(clientReq, clientRes, abortController, extSnapshot, "bootstrap", baseMeta);
   if (pre.handled) return;
-  const { forwardBody, meta } = pre;
+  const { forwardBody, headers, meta } = pre;
 
   let upstreamRes, responseHeaders, statusCode, upstreamConnectionId;
 
   try {
+    // See handleMessages' matching comment: forward the (possibly
+    // extension-mutated) headers rather than clientReq.headers directly.
     ({ upstreamRes, responseHeaders, statusCode, upstreamConnectionId } = await forwardRequest(
-      clientReq,
+      { url: clientReq.url, method: clientReq.method, headers },
       forwardBody,
       abortController.signal,
     ));
