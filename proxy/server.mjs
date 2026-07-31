@@ -640,13 +640,31 @@ if (invokedAsScript) {
       process.exit(1);
     });
 
+  // A supervised stop is a SUCCESS, however it ends. server.close() waits for
+  // in-flight requests, and a live Claude Code session always has one (the
+  // streaming /v1/messages response), so the graceful path alone never
+  // resolves — the watchdog is the normal exit under systemd, not the
+  // exception. Exiting 1 there made every `systemctl stop` log
+  // "status=1/FAILURE", which (a) makes a crash and a clean stop
+  // indistinguishable in the journal and (b) trips Restart=on-failure on a
+  // deliberate stop. Force the laggards, report the forcing on stderr, exit 0.
   const shutdown = () => {
     if (!active) {
       process.exit(0);
       return;
     }
     active.close().finally(() => process.exit(0));
-    setTimeout(() => process.exit(1), 5000).unref();
+    setTimeout(() => {
+      process.stderr.write(
+        "[cache-fix] shutdown: in-flight connections still open after 5s — forcing close\n",
+      );
+      // Node >=18.2; package.json engines allows 18.0/18.1, where the
+      // pre-existing behavior (exit without forcing) is the only option.
+      if (typeof active.server.closeAllConnections === "function") {
+        active.server.closeAllConnections();
+      }
+      process.exit(0);
+    }, 5000).unref();
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
