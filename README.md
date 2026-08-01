@@ -99,6 +99,97 @@ claude() {
 }
 ```
 
+#### Coexisting with another MITM on the same machine (`ca-trust.d`)
+
+`NODE_EXTRA_CA_CERTS` takes exactly **one** file. If anything else on the host
+also MITMs `api.anthropic.com` and also sets that variable — a corporate agent,
+an account-switching pin proxy — the last writer wins and every other CA is
+silently untrusted. Measured 2026-07-30: two such components on one machine took
+turns breaking each other's TLS, with no error attributable to either.
+
+So `--remote-control` does not simply assign the variable. It:
+
+1. **Publishes** our CA to `<config>/ca-trust.d/ccf.pem` — our own filename only,
+   never a sibling's, rewritten every launch (the proxy regenerates its CA
+   whenever the CA dir is wiped, and a stale pem advertises a key nothing signs
+   with), skipped when the bytes already match, and written via temp + `rename`
+   so a reader never sees a half-written file.
+2. **Reads** `<config>/ca-trust.pem` — a merged bundle built by exactly one
+   external writer from the ambient/corporate roots plus every published
+   `ca-trust.d/*.pem` — and points `NODE_EXTRA_CA_CERTS` at it.
+
+`<config>` is `CLAUDE_CONFIG_DIR` or `~/.claude`. **We never write the merged
+bundle**: merging requires finding the ambient corporate roots, which is
+environment-specific (a Linux host may keep them outside the bundle a shell
+points at; a Mac keeps them in the keychain), and two components both rebuilding
+it would race one output.
+
+The bundle is used only if it is intact (balanced `BEGIN`/`END` markers) **and**
+carries our own CA. A bundle failing either check is worse than no bundle — it
+would make the client distrust the very proxy it is being routed through, so
+every request fails TLS rather than merely losing some other component's CA. In
+that case, and when no bundle exists at all, the launcher falls back to our own
+CA and behaves exactly as it did before any of this existed. **A host with no
+other MITM and no bundle builder sees no change.**
+
+Both paths are fixed names under `<config>`, deliberately with no env override
+of their own. They are two halves of one rendezvous: a knob on either half alone
+lets a participant publish where no builder looks, or read a file no builder
+writes, while still appearing to implement the contract. `CLAUDE_CONFIG_DIR`
+already relocates the pair, and it moves both halves together.
+
+Note the limit of what a consumer can check: intact, and carries my CA. Whether
+the bundle is *complete* — that no corporate root went missing — is the
+builder's guarantee, not something a reader can verify, because a reader has no
+previous state to compare against and a legitimately small bundle is
+indistinguishable from a narrowed one.
+
+**This is a cooperative convention among same-user processes, not a trust
+boundary.** The check proves *parses, and carries us* — never *contains only
+approved writers*. Anyone who can write `<config>` can hand us a well-formed
+bundle holding our CA plus their own and it will be accepted, exactly as they
+could already have replaced `ca-trust.d/ccf.pem`, the CA dir, or this file. The
+contract defends against components accidentally untrusting each other, which is
+the failure that actually happens; it does not defend against a local attacker,
+who has simpler routes.
+
+#### `CACHE_FIX_DOWNLOAD_REWRITE` breaks `claude update` — leave it off
+
+`CACHE_FIX_DOWNLOAD_REWRITE=on` reads like a pure performance knob. It is not:
+turning it on **disables `claude update` entirely** on that host. Rewriting a
+download URL means reading it, which means MITM-ing `downloads.claude.ai` — and
+the release-channel client pins **public roots only** and rejects any private
+CA, so the version check dies before a byte is downloaded:
+
+```
+Failed to fetch version from .../claude-code-releases/latest after 3 attempt(s):
+  unable to verify the first certificate
+```
+
+Measured with `openssl s_client -proxy 127.0.0.1:9901 -connect downloads.claude.ai:443
+-servername downloads.claude.ai`:
+
+| `CACHE_FIX_DOWNLOAD_REWRITE` | leaf CN | verify |
+|---|---|---|
+| `on` | `api.anthropic.com` | code 21 |
+| `off` | `downloads.claude.ai` (WR3 / GTS Root R1) | code 0 |
+
+Two things make this worse than it first looks:
+
+- **It cannot be narrowed to the binary download.** MITM is decided per host at
+  `CONNECT` time, and the version check shares `downloads.claude.ai` with the
+  download itself. It is all-or-nothing per host.
+- **No client-side override reaches that client.** `HTTPS_PROXY` / `ALL_PROXY`,
+  `/etc/hosts`, `/etc/resolv.conf`, and `NODE_EXTRA_CA_CERTS` were each
+  disproved against a control on the identical path — a local resolver logged 0
+  queries and a TCP forwarder logged 0 connects across a full `claude update`,
+  while a plain `node https.get` through that same forwarder returned 200. So no
+  amount of CA injection can make the rewrite work. Only not intercepting works.
+
+Other hosts are unaffected: `github.com` through the same proxy returns its real
+certificate and verifies. The flag is off by default; keep it that way unless you
+are prepared to update Claude Code some other way.
+
 ### What the proxy does
 
 On every `/v1/messages` request, the pipeline runs an ordered chain of extensions covering cache stability, observability, thinking-desync mitigation, image, microcompact, breakpoint, bootstrap-channel, and other surfaces. Several are gated behind env vars documented in their own sections below; bootstrap-channel handling defaults to `audit` mode. The headliners:

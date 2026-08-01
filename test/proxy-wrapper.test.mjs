@@ -4,7 +4,7 @@ import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { tmpdir } from "node:os";
-import { mkdtempSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import http from "node:http";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -62,14 +62,46 @@ describe("proxy server lifecycle", () => {
 });
 
 function cleanEnv(overrides) {
-  const env = { ...process.env, ...overrides };
-  delete env.CACHE_FIX_PROXY_PORT;
-  delete env.CACHE_FIX_PROXY_UPSTREAM;
+  const env = { ...process.env };
+  // Strip from the BASE, then apply overrides, so a test that deliberately sets
+  // one of these still gets it. An ambient NO_PROXY on the developer's shell
+  // otherwise reaches the child and the merge assertions read the host's value
+  // instead of the fixture's — the lowercase-no_proxy case fails that way on any
+  // machine that exports NO_PROXY.
+  for (const k of ["CACHE_FIX_PROXY_PORT", "CACHE_FIX_PROXY_UPSTREAM", "NO_PROXY", "no_proxy"]) delete env[k];
   env.CACHE_FIX_PROXY_BIND = "127.0.0.1";
-  return env;
+  // A config dir per invocation, by DEFAULT — not opt-in per test. Forward mode
+  // publishes our CA into <config>/ca-trust.d/ccf.pem, so any test that forgot to
+  // set this published a throwaway temp CA over the developer's REAL
+  // ~/.claude/ca-trust.d/ccf.pem. Measured: one run of the CACHE_FIX_CA_DIR test
+  // took the host's pem from 5dc414fc to 3773c611, leaving the machine's merged
+  // bundle advertising a CA nothing signs with — precisely the failure this
+  // feature exists to prevent. It also silently poisons the suite itself: two
+  // cases were reading the host's real merged bundle instead of a fixture.
+  env.CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), "cffcfg-"));
+  return { ...env, ...overrides };
 }
 
 const NODE = process.execPath;
+
+// Fork the wrapper in forward mode, collect the child's output, resolve when it
+// exits. Two ca-trust tests below run the wrapper TWICE against one config dir
+// (first launch publishes our CA, second reads the bundle built from it), which
+// is what makes a named helper worth it over the inline fork the older tests use.
+async function runWrapper(script, overrides) {
+  const p = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+    env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, ...overrides }),
+  });
+  let out = "", err = "";
+  p.stdout.on("data", (c) => { out += c.toString(); });
+  p.stderr.on("data", (c) => { err += c.toString(); });
+  const code = await new Promise((res) => {
+    p.on("exit", res);
+    setTimeout(() => { p.kill("SIGTERM"); res(null); }, 15000);
+  });
+  return { code, out, err };
+}
 
 describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
   it("exits with error when claude command is not found", async () => {
@@ -135,9 +167,14 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
       'process.stdout.write("BASE="+(process.env.ANTHROPIC_BASE_URL||"UNSET")+' +
       '"|HP="+(process.env.HTTPS_PROXY||"UNSET")+' +
       '"|CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    // Own config dir: this asserts the no-bundle fallback, so it must not read the
+    // developer's real ~/.claude/ca-trust.pem. On a machine where a bundle builder
+    // has run, that file exists and legitimately wins — the assertion would fail
+    // for a host-state reason, not a code reason.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
     const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
       stdio: ["ignore", "pipe", "pipe", "ipc"],
-      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}` }),
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
     });
 
     let stdout = "";
@@ -186,6 +223,364 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     assert.ok(
       stdout.includes(`CA=${join(caDir, "ca.pem")}`),
       `NODE_EXTRA_CA_CERTS should be the CACHE_FIX_CA_DIR override (${join(caDir, "ca.pem")}), got: ${stdout}`,
+    );
+  });
+
+  // --- ca-trust.d: coexisting with another component that also MITMs ---------
+  // NODE_EXTRA_CA_CERTS takes ONE file, so a plain assignment silently untrusts
+  // whatever else needed trusting. Measured 2026-07-30: an account-switching pin proxy also
+  // MITMs api.anthropic.com and also set this var; last writer won and broke
+  // Remote Control inbound on the work Mac. The contract: each component
+  // publishes ONLY its own ca-trust.d/<name>.pem, one external writer builds the
+  // merged ca-trust.pem (it needs ambient corp-root discovery, which is
+  // environment-specific and stays out of this repo), and we READ that bundle.
+  // These four tests pin the whole contract: publish, read, isolation, fallback.
+
+  it("--remote-control publishes its CA to ca-trust.d/ccf.pem before exec'ing claude", async () => {
+    // Publishing is how OTHER components learn to trust us, and it must happen
+    // before the client runs — a bundle builder that reads the dir on a cold
+    // start would otherwise miss us and produce a bundle without our CA.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const script = 'process.stdout.write("OK\\n")';
+    const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
+    });
+
+    let stdout = "";
+    let stderr = "";
+    wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
+    wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+    const code = await new Promise((resolve) => {
+      wrapperProc.on("exit", (c) => resolve(c));
+      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
+    });
+
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
+    // The child already ran and exited, so anything on disk now was written
+    // before the exec — that ordering is the point of this assertion.
+    const published = join(configDir, "ca-trust.d", "ccf.pem");
+    assert.ok(existsSync(published), `expected published CA at ${published}. stdout: ${stdout} stderr: ${stderr}`);
+    const ours = readFileSync(join(configDir, "cache-fix-ca", "ca.pem"), "utf8");
+    assert.equal(readFileSync(published, "utf8"), ours, "published pem must be our CA verbatim");
+    assert.match(ours, /BEGIN CERTIFICATE/, "published pem should be a PEM certificate");
+  });
+
+  it("--remote-control points NODE_EXTRA_CA_CERTS at the merged bundle when one exists", async () => {
+    // The whole reason the contract exists: with a merged bundle present we must
+    // hand claude THAT, not our own CA alone, or the other component's CA is
+    // untrusted for this session.
+    // The bundle must be a REALISTIC builder output — i.e. it has to contain our
+    // own CA, because that is what the builder concatenates from ca-trust.d. A
+    // fixture without it is the stale-bundle case, which is correctly rejected
+    // (see the test below). So: run once to let the proxy generate + publish our
+    // CA, then build the bundle from it the way the launcher would, then re-run.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const bundle = join(configDir, "ca-trust.pem");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+
+    const first = await runOnce();
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+    // Mimic the launcher: ambient-ish preamble + every published component pem.
+    writeFileSync(bundle, `# merged by the launcher\n${readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8")}`);
+
+    const second = await runOnce();
+    assert.equal(second.code, 0, `Expected exit 0, got ${second.code}. stderr: ${second.err}`);
+    assert.ok(second.out.includes(`CA=${bundle}`), `NODE_EXTRA_CA_CERTS should be the merged bundle (${bundle}), got: ${second.out}`);
+  });
+
+  it("--remote-control never writes the merged bundle and never touches a sibling component's pem", async () => {
+    // Single-writer invariant. Two launchers both "helpfully" rebuilding the
+    // merged file race one output, and a component that rewrites a sibling's pem
+    // can untrust it. So: we write exactly one path, ca-trust.d/ccf.pem.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const trustDir = join(configDir, "ca-trust.d");
+    mkdirSync(trustDir, { recursive: true });
+    const sibling = join(trustDir, "other-component.pem");
+    const SIBLING_BYTES = "# another component's CA — must survive untouched\n";
+    writeFileSync(sibling, SIBLING_BYTES);
+    const script = 'process.stdout.write("OK\\n")';
+    const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
+    });
+
+    let stderr = "";
+    wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+    const code = await new Promise((resolve) => {
+      wrapperProc.on("exit", (c) => resolve(c));
+      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
+    });
+
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
+    assert.equal(readFileSync(sibling, "utf8"), SIBLING_BYTES, "sibling component's pem must be untouched");
+    assert.ok(!existsSync(join(configDir, "ca-trust.pem")), "we must NOT create the merged bundle — exactly one external writer owns it");
+    assert.ok(existsSync(join(trustDir, "ccf.pem")), "our own pem should still be published");
+  });
+
+  it("--remote-control falls back to its own CA when no merged bundle exists (unchanged standalone behaviour)", async () => {
+    // A plain CCF user with no other MITM and no bundle builder must see exactly
+    // what they saw before this contract existed.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
+    });
+
+    let stdout = "";
+    let stderr = "";
+    wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
+    wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+    const code = await new Promise((resolve) => {
+      wrapperProc.on("exit", (c) => resolve(c));
+      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
+    });
+
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
+    assert.ok(
+      stdout.includes(`CA=${join(configDir, "cache-fix-ca", "ca.pem")}`),
+      `with no bundle NODE_EXTRA_CA_CERTS must be our own CA, got: ${stdout}`,
+    );
+  });
+
+  it("--remote-control never leaves a truncated ccf.pem visible while publishing", async () => {
+    // A torn pem is not a cosmetic problem: Node's PEM reader aborts the whole
+    // extras load on an unterminated block. Measured on node v24 / openssl 3.5,
+    // with a leaf signed by the CCF CA and a bundle = good.pem + torn.pem:
+    //   torn AFTER  -> "Ignoring extra certs ... bad end line", verify still ok
+    //   torn BEFORE -> "... ASN1 lib",  verify FAILS UNABLE_TO_VERIFY_LEAF_SIGNATURE
+    // The builder concatenates sort(ca-trust.d/*.pem), so a torn OURS lands ahead
+    // of any sibling that sorts later and takes every other component CA and
+    // corporate root down with it. A plain
+    // writeFileSync(dst) is exactly what leaves that state visible to a
+    // concurrent builder, so the write must be rename-into-place.
+    //
+    // Distinguishing atomic from non-atomic needs a property that holds ONLY for
+    // rename-into-place, and "replaces a read-only file" is not it: a read-only
+    // target is also defeated by unlink-then-write, which is maximally
+    // non-atomic (a reader can observe ENOENT, then zero length, then a partial
+    // file). An earlier version of this test asserted exactly that and passed
+    // green against `unlinkSync(dst); writeFileSync(dst, ours)` — it proved
+    // nothing.
+    //
+    // The property that separates them is INODE STABILITY for an existing
+    // reader. A builder that opened ccf.pem before the publish holds a
+    // descriptor on the old inode. rename() swaps a new inode into the
+    // directory entry and leaves the old one intact and fully readable until
+    // that descriptor closes, so the reader still sees complete old content.
+    // Any in-place rewrite — O_TRUNC or unlink-and-recreate — either truncates
+    // the very bytes that reader is consuming or leaves it on a deleted inode
+    // whose content is gone. So: hold a descriptor open across the launch, then
+    // read it to the end.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const trustDir = join(configDir, "ca-trust.d");
+    const dst = join(trustDir, "ccf.pem");
+    mkdirSync(trustDir, { recursive: true });
+    // A stale published file, standing in for "an existing complete file a
+    // builder may be reading right now". Its content differs from our CA, so the
+    // publish path must replace it rather than take the byte-compare skip.
+    const STALE = "-----BEGIN CERTIFICATE-----\nc3RhbGUtcHVibGlzaGVk\n-----END CERTIFICATE-----\n";
+    writeFileSync(dst, STALE);
+    // The load-bearing observer: a descriptor held across the publish. Measured,
+    // and counter-intuitive enough to be worth stating — the 1 ms sampler below
+    // CANNOT see the O_TRUNC window for a ~1.2 KB write (100 samples over a
+    // truncate+write saw only the complete file, never length 0). Only this
+    // descriptor catches it, because O_TRUNC destroys the bytes under an existing
+    // reader while rename leaves that inode intact. Deleting these two assertions
+    // as "duplicated by the sampler" was tried and silently dropped O_TRUNC
+    // detection entirely.
+    const readerFd = openSync(dst, "r");
+    const inodeBefore = fstatSync(readerFd).ino;
+    // A builder does not hold a descriptor open across our publish — it opens
+    // ca-trust.d/*.pem by NAME whenever it rebuilds. So the property that
+    // actually protects it is that the NAME never resolves to anything but a
+    // complete file. Sample it as fast as the runtime allows for the whole
+    // launch: with rename the name is always the old or the new file; with
+    // O_TRUNC or unlink-then-write it is briefly zero-length or absent. In
+    // practice this catches a SLOW bad write, not a fast one (see the note
+    // above) — it is the cheap wide net, the descriptor is the precise one.
+    const observations = [];
+    const sampler = setInterval(() => {
+      try { observations.push(readFileSync(dst, "utf8")); }
+      catch (e) { observations.push(`ENOENT:${e.code}`); }
+    }, 1);
+
+    const script = 'process.stdout.write("OK\\n")';
+    const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
+    });
+
+    let stderr = "";
+    wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+    const code = await new Promise((resolve) => {
+      wrapperProc.on("exit", (c) => resolve(c));
+      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
+    });
+
+    clearInterval(sampler);
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
+    // THE assertion. Every sample taken by name, across the whole launch, must
+    // be one of the two COMPLETE states — never absent, never partial.
+    //
+    // Mutation-tested, and the result bounds what this test is worth:
+    //   writeFileSync(dst)  [O_TRUNC]   -> FAILS   (caught)
+    //   unlinkSync + writeFileSync      -> passes  (NOT caught)
+    //   temp + renameSync               -> passes
+    // The unlink variant's window between unlink and create is shorter than the
+    // sampler's 1 ms floor, so a timing-based observer cannot see it. Hence the
+    // test name: no TRUNCATED file is ever visible. Not "atomic" in general —
+    // proving that would need an inotify watch for IN_DELETE-before-IN_CREATE,
+    // which is not worth a dependency for a shape nothing here writes.
+    const ourCa = readFileSync(join(configDir, "cache-fix-ca", "ca.pem"), "utf8");
+    const bad = observations.filter((o) => o !== STALE && o !== ourCa);
+    assert.deepEqual(
+      bad, [],
+      `every observation of ccf.pem must be a complete file (stale or ours); saw ${bad.length} bad ` +
+      `of ${observations.length}: ${JSON.stringify(bad.slice(0, 3))}`,
+    );
+    assert.ok(observations.length > 0, "sampler must have observed the file at least once");
+    // O_TRUNC destroys the bytes under this reader; rename does not. This is the
+    // assertion that actually catches a truncating in-place write.
+    const viaOldFd = readFileSync(readerFd, "utf8");
+    closeSync(readerFd);
+    assert.equal(viaOldFd, STALE,
+      "a reader holding the pre-publish descriptor must still see the COMPLETE old pem");
+    assert.notEqual(statSync(dst).ino, inodeBefore, "publish must swap a new inode into place");
+    const pem = readFileSync(dst, "utf8");
+    assert.notEqual(pem, STALE, "publish must actually replace the stale pem");
+    assert.equal(pem, readFileSync(join(configDir, "cache-fix-ca", "ca.pem"), "utf8"), "published pem must be our CA verbatim");
+    // No leftover temp: a builder globbing *.pem must not find a partial sibling,
+    // and nothing may be left behind for the next run to trip over.
+    const leftovers = readdirSync(trustDir).filter((f) => f !== "ccf.pem");
+    assert.deepEqual(leftovers, [], `ca-trust.d must contain only ccf.pem, found: ${leftovers.join(", ")}`);
+    // Balanced markers — the exact property whose absence voids the whole bundle.
+    const begins = (pem.match(/-----BEGIN CERTIFICATE-----/g) || []).length;
+    const ends = (pem.match(/-----END CERTIFICATE-----/g) || []).length;
+    assert.equal(begins, ends, `published pem must have balanced BEGIN/END, got ${begins}/${ends}`);
+    assert.ok(begins >= 1, "published pem must contain at least one certificate");
+  });
+
+  it("--remote-control reaps an old orphan temp but leaves a concurrent publisher's fresh one alone", async () => {
+    // The reaper cannot tell an orphan from a live temp by NAME — both are
+    // ccf.pem.<pid>.<uuid>. A second launcher publishing at the same moment has
+    // written its temp and not yet renamed it; deleting that makes ITS
+    // renameSync throw a publish failure we caused, and leaves whichever
+    // launcher won first on disk rather than the current publisher's bytes.
+    // Age is the only signal available: the write-to-rename window is one small
+    // write to the same directory, so anything older than the gate is genuinely
+    // abandoned and anything younger may be in flight.
+    //
+    // Both fixtures exist in the same directory across one launch, so the test
+    // fails if the reaper is unconditional (fresh one dies) OR absent (old one
+    // survives) — one launch, two opposite outcomes.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const trustDir = join(configDir, "ca-trust.d");
+    mkdirSync(trustDir, { recursive: true });
+    const stale = join(trustDir, "ccf.pem.99999.aaaaaaaa-orphan");
+    const fresh = join(trustDir, "ccf.pem.99998.bbbbbbbb-inflight");
+    writeFileSync(stale, "# abandoned by a kill between write and rename\n");
+    writeFileSync(fresh, "# a concurrent launcher's temp, not yet renamed\n");
+    // Backdate past the gate. Real time cannot be used — the gate is a minute and
+    // a test may not sleep for one.
+    const longAgo = new Date(Date.now() - 3600_000);
+    utimesSync(stale, longAgo, longAgo);
+
+    const { code, err } = await runWrapper('process.stdout.write("OK\\n")', { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+
+    assert.ok(!existsSync(stale), "a temp older than the gate is abandoned and must be reaped");
+    assert.ok(existsSync(fresh), "a temp younger than the gate may belong to a live publisher and must survive");
+  });
+
+  it("--remote-control ignores a merged bundle that does NOT contain our own CA", async () => {
+    // The dangerous case, and worse than falling back: the bundle exists and is
+    // non-empty, so a size-only gate accepts it — but it was built BEFORE we
+    // published, so it lacks OUR CA. Handing claude that bundle makes it distrust
+    // the very proxy it is about to be routed through: every request fails TLS
+    // instead of merely losing another component's CA. A stale builder is the
+    // normal state right after a CCF upgrade, so this is not a corner case.
+    // (a sibling component hit the same hazard from the other side and guards
+    // it identically.)
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const bundle = join(configDir, "ca-trust.pem");
+    // A plausible stale bundle: real PEM content, just not ours.
+    writeFileSync(bundle, "-----BEGIN CERTIFICATE-----\nc3RhbGUtYnVuZGxlLXdpdGhvdXQtb3VyLUNB\n-----END CERTIFICATE-----\n");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
+    });
+
+    let stdout = "";
+    let stderr = "";
+    wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
+    wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+    const code = await new Promise((resolve) => {
+      wrapperProc.on("exit", (c) => resolve(c));
+      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
+    });
+
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
+    assert.ok(
+      stdout.includes(`CA=${join(configDir, "cache-fix-ca", "ca.pem")}`),
+      `a bundle missing our CA must be ignored in favour of our own CA, got: ${stdout}`,
+    );
+  });
+
+  it("--remote-control ignores a merged bundle torn AHEAD of our own entry", async () => {
+    // The case containment CANNOT see. A bundle whose earlier entry is missing its
+    // END line still literally contains our CA further down, so the "is our CA in
+    // there" gate accepts it — and that is the FATAL position, not the benign one:
+    // measured here on node v24 / openssl 3.5, an unterminated block ahead of a
+    // good one fails the handshake outright (UNABLE_TO_VERIFY_LEAF_SIGNATURE),
+    // whereas one after it merely warns. So the session would be handed a bundle
+    // that trusts nothing at all, including our own proxy.
+    //
+    // Counting BEGIN vs END markers catches exactly this and nothing else; the
+    // containment check catches the stale bundle and cannot see a tear. Both are
+    // needed, neither subsumes the other (independently reproduced by a sibling
+    // component that is both producer and consumer of the same directory).
+    //
+    // Reader beware: this is a cheap pre-flight guard, not proof. Balanced markers
+    // and containment together still do not prove Node verifies with the result —
+    // only a handshake does. They are here to keep a KNOWN-bad bundle from ever
+    // reaching the client.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const bundle = join(configDir, "ca-trust.pem");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+
+    // First run publishes our CA, so the torn bundle we then build is realistic:
+    // a builder that concatenated a truncated sibling ahead of our complete pem.
+    const first = await runOnce();
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+    const ours = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
+    const torn = "-----BEGIN CERTIFICATE-----\nc3RvbGVuLW1pZC13cml0ZQ==\n";
+    writeFileSync(bundle, `${torn}${ours}`);
+    // Precondition: containment alone WOULD accept this, so the test can only pass
+    // for the reason it claims — the marker counts, not some other rejection.
+    const raw = readFileSync(bundle, "utf8");
+    assert.ok(raw.includes(readFileSync(join(configDir, "cache-fix-ca", "ca.pem"), "utf8").trim()),
+      "fixture must still contain our CA verbatim, or this test proves nothing about the marker check");
+    assert.notEqual(
+      (raw.match(/-----BEGIN CERTIFICATE-----/g) || []).length,
+      (raw.match(/-----END CERTIFICATE-----/g) || []).length,
+      "fixture must be marker-unbalanced",
+    );
+
+    const second = await runOnce();
+    assert.equal(second.code, 0, `Expected exit 0, got ${second.code}. stderr: ${second.err}`);
+    assert.ok(
+      second.out.includes(`CA=${join(configDir, "cache-fix-ca", "ca.pem")}`),
+      `a torn bundle must be ignored in favour of our own CA, got: ${second.out}`,
     );
   });
 

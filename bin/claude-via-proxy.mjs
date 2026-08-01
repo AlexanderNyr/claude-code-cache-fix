@@ -4,7 +4,8 @@ import { fork, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { homedir } from "node:os";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { X509Certificate, randomUUID } from "node:crypto";
 import http from "node:http";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -211,7 +212,153 @@ if (remoteControl) {
   delete claudeEnv.ANTHROPIC_BASE_URL;
   claudeEnv.HTTPS_PROXY = proxyUrl;
   claudeEnv.https_proxy = proxyUrl;
-  claudeEnv.NODE_EXTRA_CA_CERTS = caPem;
+  // Publish our MITM CA where other components can find it. NODE_EXTRA_CA_CERTS
+  // takes ONE file, so whoever assigns it last wins and every other CA is
+  // silently untrusted — measured 2026-07-30 against an account-switching pin
+  // proxy, which
+  // also MITMs api.anthropic.com and also set the var, breaking Remote Control
+  // inbound on the work Mac. The fix is a directory each component publishes its
+  // own file into, so a bundle can be built from all of them.
+  //
+  // We write EXACTLY ONE path, ca-trust.d/ccf.pem, and never a sibling's.
+  // Rewritten every launch, not once: the proxy regenerates its CA whenever
+  // caDir is wiped, and a stale pem would advertise a key nothing signs with.
+  //
+  // Fixed name, no env override, for the same reason the merged bundle below has
+  // none: both halves are a rendezvous, and a knob on one half only lets this
+  // launcher publish where no builder is looking while still consuming the
+  // canonical bundle — dropping out of the contract while appearing to implement
+  // it. Relocating the pair is what CLAUDE_CONFIG_DIR already does, and it moves
+  // both sides together.
+  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  const caTrustDir = join(configDir, "ca-trust.d");
+  try {
+    mkdirSync(caTrustDir, { recursive: true });
+    const ours = readFileSync(caPem);
+    const dst = join(caTrustDir, "ccf.pem");
+    // Byte-compare skip so a bundle builder keying on mtime is not woken by a
+    // launch that changed nothing.
+    let same = false;
+    try { same = readFileSync(dst).equals(ours); } catch { /* absent => write */ }
+    if (!same) {
+      // Write a temp sibling and rename() over the target: rename is atomic on
+      // POSIX, so a builder reading the directory sees either the old complete
+      // file or the new one, never a half. A plain writeFileSync(dst) opens with
+      // O_TRUNC and leaves a torn pem visible for the duration of the write —
+      // and a torn pem does not merely lose OUR CA, it can void the ENTIRE merged
+      // bundle: Node's PEM reader aborts the whole extras load on an unterminated
+      // block. Measured on node v24 / openssl 3.5 with a leaf signed by this CA:
+      // torn entry AFTER a good one warns "bad end line" but still verifies;
+      // torn entry BEFORE it fails with UNABLE_TO_VERIFY_LEAF_SIGNATURE. The
+      // builder concatenates sort(*.pem) and "ccf.pem" sorts first, so a torn
+      // OURS lands in exactly the fatal position and takes every other component
+      // CA and corporate root down with it. Temp must be in the SAME directory —
+      // rename across filesystems is not atomic (and would EXDEV).
+      // pid alone is not unique: two launches in separate PID namespaces sharing
+      // a bind-mounted config dir can hold the same pid and collide on the temp
+      // path, so one publishes the other's bytes. uuid removes that.
+      const tmp = `${dst}.${process.pid}.${randomUUID()}`;
+      writeFileSync(tmp, ours);
+      renameSync(tmp, dst);
+    }
+    // Reap temps orphaned by a kill between the write and the rename. They do
+    // not match a *.pem glob so a builder ignores them, but nothing else would
+    // ever remove them.
+    //
+    // Age-gated, because a temp is indistinguishable from an orphan by name: a
+    // CONCURRENT launcher has its own ccf.pem.<pid>.<uuid> on disk in the window
+    // between its writeFileSync and its renameSync, and deleting that makes its
+    // rename throw a publish failure we caused. The window is one small write to
+    // the same directory, microseconds; a minute is four orders of magnitude of
+    // headroom and still collects the orphan on the next launch. Deleting late
+    // costs nothing — nothing reads these — while deleting early breaks a peer.
+    const orphanAgeMs = 60_000;
+    for (const f of readdirSync(caTrustDir)) {
+      if (!f.startsWith("ccf.pem.")) continue;
+      const p = join(caTrustDir, f);
+      try { if (Date.now() - statSync(p).mtimeMs > orphanAgeMs) rmSync(p); }
+      catch { /* raced: someone renamed or removed it first */ }
+    }
+  } catch (e) {
+    // Non-fatal: publishing is how OTHERS trust us. This session only needs its
+    // own CA, so a failure to publish must not stop it.
+    process.stderr.write(`cache-fix: could not publish CA to ${caTrustDir}: ${e.message}\n`);
+  }
+  // Read the merged bundle if something built one, so a session trusts every
+  // component's CA and not only ours.
+  //
+  // We deliberately do NOT build it. Merging must include the ambient/corporate
+  // roots, and finding those is environment-specific (a Linux host may keep them
+  // in /usr/local/share/ca-certificates/*.crt and NOT in the system bundle a
+  // shell points at; a Mac keeps them in the keychain). That knowledge does not
+  // belong in this repo. It also keeps the writer count at one: two launchers
+  // both rebuilding the bundle would race the same output. We are write-own +
+  // read-merged.
+  //
+  // No bundle => our own CA alone, byte for byte what this did before, so a host
+  // with no other MITM and no bundle builder sees no change at all.
+  // Fixed name, no env override: the builder writes this exact path (it resolves
+  // the config dir the same way), so a knob here could only ever point the two
+  // sides at different files.
+  const caTrustBundle = join(configDir, "ca-trust.pem");
+  let caForClaude = caPem;
+  // Accept the bundle only if OUR CA is actually in it. A bundle that exists and
+  // is non-empty but predates our publish (the normal state right after a CCF
+  // upgrade, or on the very first launch on a host whose builder ran earlier) is
+  // WORSE than no bundle: handing it to claude makes the client distrust the very
+  // proxy it is being routed through, so every request fails TLS instead of
+  // merely losing some other component's CA. Size alone cannot tell the two
+  // apart. readFileSync throws when absent, which is the same "use our own CA"
+  // answer as an empty, stale, or unreadable bundle — one catch covers them all.
+  //
+  // Both conditions are checked by PARSING, not by matching substrings. Node's
+  // PEM reader aborts the whole extras load on one block it cannot decode, so a
+  // damaged entry does not merely lose itself — it can void every other component
+  // CA and corporate root in the file, our own included. Counting BEGIN/END says
+  // nothing about whether a body decodes, and hard-coding the CERTIFICATE label
+  // makes any other label a corporate bundle carries invisible to the count; both
+  // gaps were measured accepting bundles that fail a real handshake. The shapes
+  // and their handshake results are in test/proxy-forward-ca.test.mjs, which
+  // asserts this decision agrees with an actual TLS verify on every one.
+  //
+  // Torn blocks have no END line, so the regex never yields them — that is why
+  // the block count is compared against the BEGIN count rather than trusted
+  // directly. A count mismatch means something in there is unterminated.
+  //
+  // Still only a pre-flight guard, not proof: it establishes the file parses and
+  // carries us, never that Node will verify a given leaf with it. Only a
+  // handshake shows that, and the launcher does not perform one.
+  //
+  // This block is a top-level script, so a test cannot import it — the same
+  // decision is mirrored in test/proxy-forward-ca.test.mjs `bundleIsUsable`.
+  // Change one, change both.
+  try {
+    const merged = readFileSync(caTrustBundle, "utf8").replace(/\r\n/g, "\n");
+    const blocks = merged.match(/-----BEGIN [^-]*-----[\s\S]*?-----END [^-]*-----/g) || [];
+    if (blocks.length !== (merged.match(/-----BEGIN /g) || []).length) throw new Error("torn block");
+    // Throws on an empty or malformed ca.pem, which must fall through rather than
+    // match everything — a zero-byte CA made the old substring test vacuously true.
+    const oursDer = new X509Certificate(readFileSync(caPem)).raw;
+    let carriesUs = false;
+    for (const block of blocks) {
+      // One unparseable block is enough to void the load, so refuse the file.
+      if (new X509Certificate(block).raw.equals(oursDer)) carriesUs = true;
+    }
+    if (!carriesUs) throw new Error("bundle does not carry our CA");
+    caForClaude = caTrustBundle;
+  } catch (e) {
+    // Absent is the normal case on a host with no builder — silent, and the same
+    // answer as every other unusable state. But a bundle that EXISTS and was
+    // refused means the one component allowed to write it produced something
+    // broken, and in a multi-component contract that has to be visible: the
+    // session still works (we fall back to our own CA) while every other
+    // component's CA is silently gone, which is precisely the failure nobody
+    // would otherwise notice.
+    if (existsSync(caTrustBundle)) {
+      process.stderr.write(`cache-fix: ignoring ${caTrustBundle} (${e.message}); using our own CA only\n`);
+    }
+  }
+  claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
   // Exclude localhost from the proxy. Without this, HTTPS_PROXY routes EVERY
   // connection claude makes — including to local services like HTTP/SSE-transport
   // MCP servers (e.g. an MCP on 127.0.0.1) — at the cache-fix proxy, which only
