@@ -3,10 +3,11 @@
 import { fork, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
-import { homedir } from "node:os";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { X509Certificate, randomUUID } from "node:crypto";
 import http from "node:http";
+import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
@@ -132,7 +133,13 @@ if (proxyUpstream) proxyEnv.CACHE_FIX_PROXY_UPSTREAM = proxyUpstream;
 // Forward-proxy mode: the spawned proxy must attach the CONNECT/MITM handler,
 // or the HTTPS_PROXY wiring below would tunnel to a proxy that only speaks
 // reverse-proxy and never terminates TLS for the upstream host.
-if (remoteControl) proxyEnv.CACHE_FIX_FORWARD_PROXY = "on";
+if (remoteControl) {
+  proxyEnv.CACHE_FIX_FORWARD_PROXY = "on";
+  // ...and tell it we will wire claude ourselves, so it does not print a recipe
+  // that would undo that. Internal handshake between these two files,
+  // deliberately not an operator knob — see the banner in proxy/server.mjs.
+  proxyEnv.CACHE_FIX_WIRED_BY_LAUNCHER = "1";
+}
 
 const proxyProc = fork(SERVER_PATH, [], {
   stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -215,9 +222,8 @@ if (remoteControl) {
   // Publish our MITM CA where other components can find it. NODE_EXTRA_CA_CERTS
   // takes ONE file, so whoever assigns it last wins and every other CA is
   // silently untrusted — measured 2026-07-30 against an account-switching pin
-  // proxy, which
-  // also MITMs api.anthropic.com and also set the var, breaking Remote Control
-  // inbound on the work Mac. The fix is a directory each component publishes its
+  // proxy, which also MITMs api.anthropic.com and also set the var, breaking
+  // Remote Control inbound on the work Mac. The fix is a directory each component publishes its
   // own file into, so a bundle can be built from all of them.
   //
   // We write EXACTLY ONE path, ca-trust.d/ccf.pem, and never a sibling's.
@@ -232,14 +238,42 @@ if (remoteControl) {
   // both sides together.
   const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
   const caTrustDir = join(configDir, "ca-trust.d");
+  const PUBLISHED_CA_NAME = "ccf.pem";
+
+// The salvage scratch dir's name, in ONE place. Two matching string literals is
+// how the reaper below came to match `cache-fix-ca-prod` — an operator CA dir,
+// which README documents living under /tmp — and delete the private key the
+// running proxy signs with. A constant makes the mkdtemp and the glob provably
+// the same set.
+const SCRATCH_PREFIX = "cache-fix-ca-scratch-";
   try {
     mkdirSync(caTrustDir, { recursive: true });
     const ours = readFileSync(caPem);
-    const dst = join(caTrustDir, "ccf.pem");
+    // Parse BEFORE publishing. Validating later (we do, at the own-CA step
+    // below) still handed a corrupt ca.pem to every OTHER component: "ccf" sorts
+    // first in the builder's sort(*.pem), so a bad entry lands in the same fatal
+    // leading position the torn-write guard above protects — measured, such a
+    // bundle loads 0 extra CAs and warns `bad base64 decode`. Atomicity
+    // guarantees whole bytes, never loadable ones. Throwing lands in the catch
+    // below, leaving any previous good ccf.pem in place for siblings to keep
+    // trusting.
+    new X509Certificate(ours);
+    // The published name and the orphan-sweep prefix, derived from one constant.
+    // Two matching literals is how SCRATCH_PREFIX came to delete an operator CA
+    // dir; this pair is the same hazard 50 lines earlier and was still two
+    // literals. Measured with the prefix shortened by one character: the sweep
+    // removed `ccf.pem` itself — the CA every other component reads.
+    const dst = join(caTrustDir, PUBLISHED_CA_NAME);
     // Byte-compare skip so a bundle builder keying on mtime is not woken by a
     // launch that changed nothing.
     let same = false;
-    try { same = readFileSync(dst).equals(ours); } catch { /* absent => write */ }
+    // ANY read failure means "write": absent, unreadable, EACCES, EISDIR, torn.
+    // Measured with dst at mode 0: same=false, and the branch republishes OURS.
+    // Safe because the only thing this branch can write is our own CA via
+    // temp+rename — the collapse cannot publish worse content than it could not
+    // read. That is a property of the WRITE, not of this catch; publish anything
+    // else here and an unreadable dst becomes indistinguishable from a stale one.
+    try { same = readFileSync(dst).equals(ours); } catch { /* see above */ }
     if (!same) {
       // Write a temp sibling and rename() over the target: rename is atomic on
       // POSIX, so a builder reading the directory sees either the old complete
@@ -261,29 +295,41 @@ if (remoteControl) {
       writeFileSync(tmp, ours);
       renameSync(tmp, dst);
     }
-    // Reap temps orphaned by a kill between the write and the rename. They do
-    // not match a *.pem glob so a builder ignores them, but nothing else would
-    // ever remove them.
-    //
-    // Age-gated, because a temp is indistinguishable from an orphan by name: a
-    // CONCURRENT launcher has its own ccf.pem.<pid>.<uuid> on disk in the window
-    // between its writeFileSync and its renameSync, and deleting that makes its
-    // rename throw a publish failure we caused. The window is one small write to
-    // the same directory, microseconds; a minute is four orders of magnitude of
-    // headroom and still collects the orphan on the next launch. Deleting late
-    // costs nothing — nothing reads these — while deleting early breaks a peer.
-    const orphanAgeMs = 60_000;
-    for (const f of readdirSync(caTrustDir)) {
-      if (!f.startsWith("ccf.pem.")) continue;
-      const p = join(caTrustDir, f);
-      try { if (Date.now() - statSync(p).mtimeMs > orphanAgeMs) rmSync(p); }
-      catch { /* raced: someone renamed or removed it first */ }
-    }
   } catch (e) {
     // Non-fatal: publishing is how OTHERS trust us. This session only needs its
     // own CA, so a failure to publish must not stop it.
     process.stderr.write(`cache-fix: could not publish CA to ${caTrustDir}: ${e.message}\n`);
   }
+  // Reap temps orphaned by a kill between the write and the rename. They do not
+  // match a *.pem glob so a builder ignores them, but nothing else would ever
+  // remove them.
+  //
+  // Its OWN try, deliberately outside the publish one. Sharing that block made
+  // reaping conditional on the rename succeeding, so exactly when publishing is
+  // persistently broken — a root-owned ccf.pem, a read-only mount, ENOSPC — the
+  // launcher abandoned one full-CA temp per launch and cleaned up none of them,
+  // growing without bound in the directory a builder globs.
+  //
+  // Age-gated, because a temp is indistinguishable from an orphan by name: a
+  // CONCURRENT launcher has its own ccf.pem.<pid>.<uuid> on disk in the window
+  // between its writeFileSync and its renameSync, and deleting that makes its
+  // rename throw a publish failure we caused. The window is one small write to
+  // the same directory, microseconds; a minute is four orders of magnitude of
+  // headroom and still collects the orphan on the next launch. Deleting late
+  // costs nothing — nothing reads these — while deleting early breaks a peer.
+  try {
+    const orphanAgeMs = 60_000;
+    for (const f of readdirSync(caTrustDir)) {
+      if (!f.startsWith(`${PUBLISHED_CA_NAME}.`)) continue;
+      const p = join(caTrustDir, f);
+      try { if (Date.now() - statSync(p).mtimeMs > orphanAgeMs) rmSync(p); }
+      // Raced, OR the delete was REFUSED — measured with the dir at mode 0500:
+      // removed=0, file still there. Tolerable because a survivor is disk, not
+      // trust: this name is `ccf.pem.<pid>.<uuid>` and does not end in `.pem`,
+      // so no builder globbing `*.pem` reads it.
+      catch { /* see above */ }
+    }
+  } catch { /* unreadable dir: the publish warning above already said so */ }
   // Read the merged bundle if something built one, so a session trusts every
   // component's CA and not only ours.
   //
@@ -302,63 +348,264 @@ if (remoteControl) {
   // sides at different files.
   const caTrustBundle = join(configDir, "ca-trust.pem");
   let caForClaude = caPem;
-  // Accept the bundle only if OUR CA is actually in it. A bundle that exists and
-  // is non-empty but predates our publish (the normal state right after a CCF
-  // upgrade, or on the very first launch on a host whose builder ran earlier) is
-  // WORSE than no bundle: handing it to claude makes the client distrust the very
-  // proxy it is being routed through, so every request fails TLS instead of
-  // merely losing some other component's CA. Size alone cannot tell the two
-  // apart. readFileSync throws when absent, which is the same "use our own CA"
-  // answer as an empty, stale, or unreadable bundle — one catch covers them all.
-  //
-  // Both conditions are checked by PARSING, not by matching substrings. Node's
-  // PEM reader aborts the whole extras load on one block it cannot decode, so a
-  // damaged entry does not merely lose itself — it can void every other component
-  // CA and corporate root in the file, our own included. Counting BEGIN/END says
-  // nothing about whether a body decodes, and hard-coding the CERTIFICATE label
-  // makes any other label a corporate bundle carries invisible to the count; both
-  // gaps were measured accepting bundles that fail a real handshake. The shapes
-  // and their handshake results are in test/proxy-forward-ca.test.mjs, which
-  // asserts this decision agrees with an actual TLS verify on every one.
-  //
-  // Torn blocks have no END line, so the regex never yields them — that is why
-  // the block count is compared against the BEGIN count rather than trusted
-  // directly. A count mismatch means something in there is unterminated.
-  //
-  // Still only a pre-flight guard, not proof: it establishes the file parses and
-  // carries us, never that Node will verify a given leaf with it. Only a
-  // handshake shows that, and the launcher does not perform one.
-  //
-  // This block is a top-level script, so a test cannot import it — the same
-  // decision is mirrored in test/proxy-forward-ca.test.mjs `bundleIsUsable`.
-  // Change one, change both.
+  // Our own CA is parsed in its OWN step, before the bundle is even read.
+  // Folded into the bundle try (as it was), a corrupt or zero-byte ca.pem threw
+  // from the X509 parse and printed `ignoring <ca-trust.pem> (no start line)` —
+  // naming a file that may be perfectly healthy — and then fell back to the very
+  // ca.pem that had just failed to parse. Same failure, wrong component blamed.
+  let ourCa = null;
   try {
-    const merged = readFileSync(caTrustBundle, "utf8").replace(/\r\n/g, "\n");
-    const blocks = merged.match(/-----BEGIN [^-]*-----[\s\S]*?-----END [^-]*-----/g) || [];
-    if (blocks.length !== (merged.match(/-----BEGIN /g) || []).length) throw new Error("torn block");
-    // Throws on an empty or malformed ca.pem, which must fall through rather than
-    // match everything — a zero-byte CA made the old substring test vacuously true.
-    const oursDer = new X509Certificate(readFileSync(caPem)).raw;
-    let carriesUs = false;
-    for (const block of blocks) {
-      // One unparseable block is enough to void the load, so refuse the file.
-      if (new X509Certificate(block).raw.equals(oursDer)) carriesUs = true;
-    }
-    if (!carriesUs) throw new Error("bundle does not carry our CA");
-    caForClaude = caTrustBundle;
+    ourCa = readFileSync(caPem);
+    new X509Certificate(ourCa);
   } catch (e) {
-    // Absent is the normal case on a host with no builder — silent, and the same
-    // answer as every other unusable state. But a bundle that EXISTS and was
-    // refused means the one component allowed to write it produced something
-    // broken, and in a multi-component contract that has to be visible: the
-    // session still works (we fall back to our own CA) while every other
-    // component's CA is silently gone, which is precisely the failure nobody
-    // would otherwise notice.
-    if (existsSync(caTrustBundle)) {
-      process.stderr.write(`cache-fix: ignoring ${caTrustBundle} (${e.message}); using our own CA only\n`);
+    ourCa = null;
+    // And do NOT hand claude the file that just failed to parse. Node reads
+    // NODE_EXTRA_CA_CERTS once at startup and warns-and-continues on a bad one,
+    // so pointing at it buys nothing and costs the ambient roots nothing either
+    // way — but naming it implies it is a CA we vouch for. Leaving the variable
+    // unset falls back to node's built-in store, which is the honest state: we
+    // have no usable CA to add. The proxy will have failed to attach its MITM
+    // for the same reason, so the session needs the ambient roots, not ours.
+    caForClaude = null;
+    process.stderr.write(
+      `cache-fix: our own CA at ${caPem} does not parse (${e.message}); ` +
+        `remove ${caDir} and relaunch to regenerate it\n`,
+    );
+  }
+  // Accept the bundle only if node's loader really loads our CA from it. The
+  // decision lives in bin/ca-trust.mjs so the tests drive this exact code; it
+  // used to be inline here with a hand-copied twin in the test file, and
+  // mutating this one left the whole suite green.
+  // The probe needs a leaf OUR CA issued; the proxy's own is right here and is
+  // regenerated alongside ca.pem, so it cannot drift out of sync with it.
+  // The host must be the one the leaf's SAN covers, which forward-proxy.mjs
+  // derives from the upstream — so a session launched with --proxy-upstream
+  // gets a leaf for THAT host, and a probe asking for api.anthropic.com fails
+  // the name check and refuses a perfectly good bundle on every launch.
+  // Resolved from the same inputs, in the same order, as the proxy uses.
+  // Reading it off the leaf's SAN instead was tried and reverted. It is the same
+  // predict-vs-ask substitution as the rest of this change, and it looked
+  // strictly better — but the divergence it protects against does not exist:
+  // `ensureCA`'s `leafCoversAllHosts()` re-mints the leaf whenever its SAN stops
+  // covering the current upstream, so by the time this runs the two sources
+  // agree by construction. Measured: with the SAN read in place, mutating it
+  // back to this derivation left the whole suite green, and the test written to
+  // separate them could not, because no reachable state separates them.
+  let probeHost = "api.anthropic.com";
+  try { probeHost = new URL(proxyUpstream || process.env.CACHE_FIX_PROXY_UPSTREAM
+                            || "https://api.anthropic.com").hostname; } catch { /* default */ }
+  const probeLeaf = { keyPath: join(caDir, "leaf.key"), certPath: join(caDir, "leaf.pem"),
+                      host: probeHost };
+
+  // No `existsSync(leaf.key)` here. It used to gate this block, and an absent
+  // leaf key then skipped everything SILENTLY: `caForClaude` stayed at our own
+  // CA and nothing was printed. That is a probe-that-could-not-be-run narrowing
+  // trust, which is the one thing the three-outcome contract exists to forbid —
+  // measured with a healthy 2-CA merge present, the gate handed over 1 CA with
+  // no message, where letting the block run reports `unknown` and salvages 3.
+  // The probe already answers "local" for an unreadable key, and the code below
+  // routes that like every other unknown, so the guard was both redundant and
+  // wrong. It was also weaker than it looked: `existsSync` on a DIRECTORY named
+  // leaf.key returns true, so it never caught the unusable case anyway.
+  if (ourCa && existsSync(caTrustBundle)) {
+    // mkdtemp, not a pid-named file: it is atomically exclusive and 0700, so
+    // nothing can pre-create the path as a symlink to somewhere else, a
+    // recycled pid cannot collide with a stale file, and a leftover is
+    // unreadable by anyone else. Left behind deliberately — node reads
+    // NODE_EXTRA_CA_CERTS at startup and claude holds it for the session.
+    let scratch = null, nth = 0;
+    const writeTmp = (text) => {
+      scratch ??= mkdtempSync(join(tmpdir(), SCRATCH_PREFIX));
+      const p = join(scratch, `b${++nth}.pem`);
+      writeFileSync(p, text);
+      return p;
+    };
+    // ...but "left behind deliberately" is not "left behind forever". One dir
+    // per salvage launch, and nothing else on the machine removes them: 81 had
+    // accumulated here during this change's own development.
+    //
+    // The gate is SEVEN DAYS, not the day it was first written. A scratch dir's
+    // mtime is LAUNCH time — it is written once and never touched again — so a
+    // shorter gate deletes the bundle out from under a session that is merely
+    // long-lived. That is not free: claude spawns node children (hooks, MCP
+    // servers, tool subprocesses) which inherit NODE_EXTRA_CA_CERTS and re-read
+    // it. Measured with the path deleted: `Warning: Ignoring extra certs ...
+    // No such file or directory`, extras loaded 0. The already-running process
+    // is fine; every child it starts is not. Seven days still collects.
+    //
+    // The prefix is SCRATCH_PREFIX and nothing shorter. `cache-fix-ca-` also
+    // matches an operator CA dir — README documents `CACHE_FIX_CA_DIR=/tmp/
+    // cache-fix-ca`, and any suffixed variant (`-prod`, `-work`) is caught by
+    // that glob. Measured with the previous prefix: a dir holding ca.key,
+    // ca.pem, leaf.key and leaf.pem was removed entirely, taking the private
+    // key the running proxy signs with. `mkdtempSync` guarantees OUR dir is
+    // unique; it guarantees nothing about what else shares a prefix, so the two
+    // sites read one constant rather than two matching string literals.
+    try {
+      const scratchAgeMs = 7 * 86_400_000;
+      for (const f of readdirSync(tmpdir())) {
+        if (!f.startsWith(SCRATCH_PREFIX)) continue;
+        const p = join(tmpdir(), f);
+        try { if (Date.now() - statSync(p).mtimeMs > scratchAgeMs) rmSync(p, { recursive: true }); }
+        // Someone else's, already gone, or REFUSED (dir mode 0500, measured).
+        // A survivor is litter under tmpdir() that nothing reads — unlike a
+        // refused delete that leaves a live state armed, which would need code.
+        catch { /* see above */ }
+      }
+    } catch { /* unreadable tmpdir: not worth failing a launch over */ }
+    // A read-only or absent TMPDIR must not take the session down. Every path
+    // in here is a fallback path already; throwing from one turns "the merged
+    // bundle is broken" into "the launcher does not start", and because this
+    // runs at top level the throw would also skip cleanup() and orphan the
+    // proxy we forked above.
+    let verdict;
+    try {
+      verdict = bundleUsable(caTrustBundle, probeLeaf);
+      // BOTH questions, not just the handshake. `verdict.ok` means node verified
+      // our leaf with this file — a NODE answer, and the consumer is Bun's
+      // BoringSSL. They disagree on exactly one shape: our CA followed by a
+      // fatal block. node stops at the damage and keeps what it read, so the
+      // handshake succeeds; the client discards the whole file, and a discarded
+      // file also takes down CAs supplied through `SSL_CERT_FILE` or
+      // `SSL_CERT_DIR` (measured, two independent sources). Handing that over is
+      // worse than handing over our own CA alone.
+      //
+      // `!== false` so a probe that could not answer keeps the merge: this is
+      // the branch where the handshake SUCCEEDED, so there is positive evidence
+      // for the file and none against it. The gate below is reached after a
+      // refusal and takes the opposite default for that reason.
+      // No second spawn here. `verdict.ok` means node verified a leaf OUR CA
+      // signed, so node necessarily loaded our CA — the census's Y/N half is
+      // already implied on this branch, and only its "would the client discard
+      // the file" half added anything. That half now rides on the handshake's
+      // own stderr (`verdict.discarded`), measured from the same child: the
+      // split shape returns `CATRUST-OK 1` on stdout AND the warning on stderr.
+      // One spawn instead of two on every healthy launch.
+      if (verdict.ok && !verdict.discarded) {
+        caForClaude = caTrustBundle;
+      } else {
+        // Refused, or unjudgeable. Both rebuild rather than hand the merge
+        // over: a bundle node loads nothing from makes claude distrust the very
+        // proxy it is routed through, and `unknown` cannot rule that out.
+        //
+        // They differ in what the rebuild KEEPS, and that is what makes routing
+        // them together safe. salvage drops a publisher ONLY on a real refusal,
+        // so when the probe is broken for everything (no leaf to serve, no
+        // interpreter), every file is kept and the rebuild reproduces what the
+        // merge carried. Measured, two publishers + our CA, leaf key removed:
+        // verdict `unknown`, salvage returns a rebuild node loads 2 CAs from,
+        // where narrowing to our own CA gives 1.
+        //
+        // Under a real refusal the same code drops exactly the broken file, and
+        // the saving is one certificate per surviving publisher. This host holds
+        // ours plus one peer, so it is 2 vs 1 here; measured on a
+        // three-publisher host it was 3 vs 1. One branch, because the keep rule
+        // already encodes the distinction.
+        //
+        // Both halves are load-bearing and BOTH have been wrong here before:
+        // the keep rule named the accepted values and silently dropped a fourth
+        // one, and the rebuild's own re-check discarded on `!ok` when `unknown`
+        // is also not-ok. Either alone turns this branch into "narrow to our CA
+        // whenever we could not ask" — the failure the branch exists to avoid.
+        const salvaged = salvageBundle(caTrustDir, ourCa, probeLeaf, writeTmp);
+        // Salvage null does not mean our own CA. It means nothing was REBUILT,
+        // and the merge on disk may still be perfectly good — this branch is
+        // reached on `unknown` as well as on a refusal, and `unknown` is mostly
+        // "the probe could not run", not "the bundle is broken".
+        //
+        // Three answers have been shipped here and the first two were both
+        // wrong in one direction each:
+        //   - "keep it if node loads ANYTHING from it" — a STALE merge (built
+        //     before we published, the normal state right after an upgrade)
+        //     loads a corporate cert and carries none of ours, so it passed and
+        //     the session failed TLS against the proxy it was routed through.
+        //   - "narrow to our CA whenever we could not judge" — honest, and it
+        //     costs a healthy merge every OTHER publisher on the box. Measured:
+        //     2 CAs on disk, 1 handed over, and the ambient corporate root the
+        //     builder merged in is not in `ca-trust.d` for salvage to recover.
+        //
+        // "Loads something" and "loads OURS" are different questions, and only
+        // the second one separates the two cases. It is answered by asking node
+        // which certificates it loaded — no handshake, so it still answers in
+        // exactly the conditions where the handshake cannot, which is what made
+        // the previous two answers reach for a proxy for it.
+        //
+        // It cannot answer before v22.15 (`engines: >=18`), and there it
+        // returns true: keep the merge. Same direction as every other unknown,
+        // and the merge is what the builder published — narrowing on a runtime
+        // that simply cannot be asked would drop every corporate root on it.
+        // The probe answers `true` / `false` / `null`, and `null` is "could not
+        // ask". This gate is reached only AFTER the merge was refused or could
+        // not be judged, so an unmeasured answer must land on `caPem` — the one
+        // file we have direct evidence for. What made that wrong before was the
+        // PROBE returning `true` when it could not ask, not the test here: on
+        // any runtime before v22.15 (most of `engines: >=18`) that was every
+        // launch with a stale merge. Salvage's gate takes the opposite default,
+        // and does need `=== false` to say so; this one only needs to not treat
+        // a non-answer as a yes, which `null` being falsy already gives it.
+        // A PROBE MAY VETO, NEVER APPROVE ALONE. This branch is reached because
+        // the handshake said `not ok` OR could not answer, and the census was
+        // letting it re-approve the very bundle the handshake had just refused.
+        // Measured: a merge carrying our CA, probed against a host the leaf does
+        // not cover — handshake `NOT OK`, census `true`, launcher handed over the
+        // merge. The two ask different questions, so "our CA is loaded" is not
+        // evidence that our proxy verifies.
+        //
+        // So the census only gets a say where the handshake ABSTAINED. On a
+        // definitive refusal there is direct evidence against the file and the
+        // fallback is the one thing proven to work.
+        // THE MERGE FIRST WHEN NOTHING FAULTED IT. `salvaged ||` put the rebuild
+        // ahead of everything, so on `unknown` a rebuild pre-empted a merge the
+        // census had just confirmed carries our CA. The rebuild can only hold
+        // what `ca-trust.d` supplies, and the ambient corporate roots are not
+        // there (see the limit stated above the salvage call), so it is a strict
+        // SUBSET whenever the merge carries one. Measured on this box's real
+        // bundle: merge 132 CAs, rebuild 2 — 130 dropped with nothing refused.
+        //
+        // That is the rule that deleted the `dupes` counter, applied generally
+        // instead of to one instance: narrowing on an answer we did not get is
+        // R2 broken, and "could not ask" is not evidence against the file.
+        //
+        // Salvage still wins on a REFUSAL, which is the branch it was written
+        // for — there the merge has evidence against it and the rebuild is the
+        // best available. Not claimed: that either side dominates universally. A
+        // merge built before a new peer published carries ours and misses that
+        // peer, so a rebuild can hold something the merge lacks. Taking the
+        // max of both would need its own measurement.
+        caForClaude = (verdict.unknown && carriesOurCA(caTrustBundle, ourCa))
+          ? caTrustBundle
+          : (salvaged || caPem);
+        // Three outcomes, so three messages. The old line said "using our own CA
+        // only" for everything that was not a salvage, which would now report a
+        // KEPT merge as a narrowing — the operator reads this to find out what
+        // their session is trusting, and a wrong answer here is worse than none.
+        process.stderr.write(
+          // Every verdict that reaches this branch carries a `reason` — the four
+          // are `local`, `null`, `discarded`, and a plain refusal. The bare
+          // `{ok:true}` is the happy path and never arrives here. A `??`
+          // fallback used to sit on this expression and was measured UNREACHED
+          // (a write-marker on each side: the left fired, the right never did),
+          // so it was dead code that read as a safety net. It was added for
+          // `{ok:true, discarded:true}`, which does carry a reason.
+          `cache-fix: ${caTrustBundle} ${verdict.unknown ? "could not be verified" : "is unusable"} ` +
+            `(${verdict.reason}); ` +
+            // Tested in the SAME order the value above is computed, and the
+            // first arm READS that value rather than re-deriving it. Testing
+            // `salvaged` first re-derives, and the two disagree on exactly the
+            // branch the keep-the-merge arm added: salvage can succeed while
+            // the merge is what gets handed over, so it reported a rebuild
+            // about a file it kept.
+            `${caForClaude === caTrustBundle ? "keeping it: node loads our CA from it"
+              : salvaged ? "rebuilt from the publishers that work"
+              : "using our own CA only"}\n`);
+      }
+    } catch (e) {
+      caForClaude = caPem;
+      process.stderr.write(`cache-fix: could not evaluate ${caTrustBundle} (${e.message}); using our own CA only\n`);
     }
   }
-  claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
+  if (caForClaude) claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
+  else delete claudeEnv.NODE_EXTRA_CA_CERTS;
   // Exclude localhost from the proxy. Without this, HTTPS_PROXY routes EVERY
   // connection claude makes — including to local services like HTTP/SSE-transport
   // MCP servers (e.g. an MCP on 127.0.0.1) — at the cache-fix proxy, which only

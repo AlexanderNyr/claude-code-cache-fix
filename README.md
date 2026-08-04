@@ -160,7 +160,14 @@ The generated systemd unit / launchd agent carries `CACHE_FIX_FORWARD_PROXY=on`,
 - `HTTPS_PROXY` — where the proxy listens: `http://127.0.0.1:<port>` (default port `9801`, or your `CACHE_FIX_PROXY_PORT`).
 - `NODE_EXTRA_CA_CERTS` — the CA the proxy generated on first start: `~/.claude/cache-fix-ca/ca.pem` (or `$CACHE_FIX_CA_DIR/ca.pem`).
 
-Three ways to wire it, depending on how broadly you want the vars to apply:
+Three ways to wire it, depending on how broadly you want the vars to apply.
+
+> **If anything else on this host also MITMs `api.anthropic.com`** — a corporate
+> TLS-inspecting agent, an account-switching pin proxy — do not use these
+> recipes. `NODE_EXTRA_CA_CERTS` takes one file, so pinning it to our CA alone
+> silently untrusts every other component. Use `--remote-control`, which
+> publishes into `ca-trust.d/` and consumes the merged bundle instead. See
+> [Coexisting with another MITM](#coexisting-with-another-mitm-on-the-same-machine-ca-trustd).
 
 ```bash
 # a) per-invocation — scoped to just this claude run
@@ -207,13 +214,39 @@ environment-specific (a Linux host may keep them outside the bundle a shell
 points at; a Mac keeps them in the keychain), and two components both rebuilding
 it would race one output.
 
-The bundle is used only if it is intact (balanced `BEGIN`/`END` markers) **and**
-carries our own CA. A bundle failing either check is worse than no bundle — it
-would make the client distrust the very proxy it is being routed through, so
-every request fails TLS rather than merely losing some other component's CA. In
-that case, and when no bundle exists at all, the launcher falls back to our own
-CA and behaves exactly as it did before any of this existed. **A host with no
-other MITM and no bundle builder sees no change.**
+The bundle is used only if node, handed that file, will actually verify our
+proxy's leaf. The launcher does not predict that — it asks: a child process with
+`NODE_EXTRA_CA_CERTS` set from birth stands up a TLS server holding our leaf and
+connects to it. Only a bundle from which the loader really loaded our CA can
+complete that handshake.
+
+A bundle failing that is worse than no bundle — it would make the client
+distrust the very proxy it is being routed through, so every request fails TLS
+rather than merely losing some other component's CA.
+
+**Why ask rather than parse.** The previous version modelled node's loader in a
+regex: base64 quanta, padding position, dash runs in markers, which of ten
+whitespace characters openssl tolerates. It took five review rounds and was
+still wrong in *both* directions on a real bundle — accepting one node loads
+nothing from, and refusing one node loads fine. The rule it was reaching for
+turns out not to be expressible from outside: an identical tear is recovered or
+fatal depending only on whether its truncated body happens to be complete DER,
+which is a question about bytes the parser cannot answer. The loader can, in one
+spawn (~25 ms over a bare `node -e ''` — measured, 40 interleaved pairs: 17.3 ms
+bare, 42.4 ms probed). What that is 25 ms *of*: a `--remote-control` launch is
+~520 ms end to end, of which ~493 ms is forking the proxy and waiting for it to
+listen. So the probe is ~8% of a launch and very nearly all of the CA work.
+
+**Three outcomes, never two.** `ok`, `not ok`, and `unknown` — the last meaning
+the probe could not be run at all. A guard that answers "unusable" when it could
+not ask drops every corporate root on a machine whose bundle was fine.
+
+**A damaged merge does not cost the other publishers their CAs.** The damage
+lives in the merge, not in the files that fed it, so the launcher rebuilds from
+the `ca-trust.d/` publishers that still work rather than falling back to its own
+CA alone. The saving is one certificate per surviving publisher: measured on
+this box (ours plus one peer), one certificate under the old fallback against
+two under the rebuild; on a three-publisher host, one against three.
 
 Both paths are fixed names under `<config>`, deliberately with no env override
 of their own. They are two halves of one rendezvous: a knob on either half alone
@@ -221,11 +254,18 @@ lets a participant publish where no builder looks, or read a file no builder
 writes, while still appearing to implement the contract. `CLAUDE_CONFIG_DIR`
 already relocates the pair, and it moves both halves together.
 
-Note the limit of what a consumer can check: intact, and carries my CA. Whether
-the bundle is *complete* — that no corporate root went missing — is the
-builder's guarantee, not something a reader can verify, because a reader has no
-previous state to compare against and a legitimately small bundle is
-indistinguishable from a narrowed one.
+Note the limit of what a consumer checks: intact, and carries my CA. Whether the
+bundle is *complete* — that no corporate root went missing — is the builder's
+guarantee, and a consumer must not act on it even where it could.
+
+That is a design choice, not a missing capability, and the distinction matters
+because the other reading is an invitation: someone adds the previous bundle as
+state, believes the limitation is lifted, and adds a floor. It would still be
+wrong. A shrink is *legitimate* whenever a root is retired or a component is
+uninstalled, and only the builder knows which happened — so a reader holding
+both bundles still cannot tell a regression from a fact. Measured: a legitimate
+bundle is 5 certs on one machine here and 168 on another, so any floor that
+catches narrowing on one host rejects a healthy bundle on the next.
 
 **This is a cooperative convention among same-user processes, not a trust
 boundary.** The check proves *parses, and carries us* — never *contains only

@@ -614,11 +614,26 @@ export async function startProxy(options = {}) {
 
   const addr = server.address();
   if (forwardProxyCA) {
-    process.stderr.write(
-      "[cache-fix] forward-proxy: on. Wire the client (leave ANTHROPIC_BASE_URL UNSET so Remote Control stays enabled):\n" +
-      `  export HTTPS_PROXY=http://${addr.address}:${addr.port}\n` +
-      `  export NODE_EXTRA_CA_CERTS=${forwardProxyCA}\n`,
-    );
+    // Recipe only when the OPERATOR is wiring. Under --remote-control the
+    // launcher already wired claude via ca-trust.d and relays this stderr, so
+    // printing `export NODE_EXTRA_CA_CERTS=<our ca.pem>` would tell them to undo
+    // it — that variable takes one file, so pinning our CA untrusts every other
+    // MITM on the host.
+    //
+    // An explicit signal, NOT `process.channel`: a channel only proves some
+    // parent opened an IPC descriptor, and measured, a plain `fork()` (which the
+    // suite does) got the suppressed banner and no wiring instructions at all.
+    // Internal handshake, not an operator knob — it asserts "my parent wired
+    // me", which nothing but the launcher can truthfully say.
+    const wiredByLauncher = process.env.CACHE_FIX_WIRED_BY_LAUNCHER === "1";
+    process.stderr.write(wiredByLauncher
+      ? "[cache-fix] forward-proxy: on. Client wired by the launcher (ca-trust.d).\n"
+      : "[cache-fix] forward-proxy: on. Wire the client (leave ANTHROPIC_BASE_URL UNSET so Remote Control stays enabled):\n" +
+        `  export HTTPS_PROXY=http://${addr.address}:${addr.port}\n` +
+        `  export NODE_EXTRA_CA_CERTS=${forwardProxyCA}\n` +
+        "  (if anything else on this host also MITMs api.anthropic.com, use\n" +
+        "   `claude-via-proxy --remote-control` instead — that variable takes\n" +
+        "   one file, so setting it here would untrust the other CA)\n");
   }
   let closed = false;
   return {
