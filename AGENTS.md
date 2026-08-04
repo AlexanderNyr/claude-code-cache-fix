@@ -128,6 +128,61 @@ This binds every reviewer — Codex, the implementation agent's own
 maintainer comments, and any third model added later. A finding relayed
 without its class is not usable by the next reader.
 
+### Look at CI before approving
+
+**Check the status rollup on the head you are approving. Cancelled,
+pending, queued, and absent are all "not green."** Say which you saw.
+
+This is the cheapest control available and the easiest to skip, because
+a PR page shows a review box and a checks box and only one of them asks
+for your attention.
+
+Measured on #296, from the review and workflow timestamps:
+
+```
+head       CI                    approvals                  green first?
+82c9f27e   cancelled   11:06Z    10:46Z, 15:18Z             no
+4a32d142   never completed       16:39Z, 17:18Z             no
+5e6a2e04   success     17:56Z    19:13Z, 19:18Z             yes
+```
+
+Four of the six approvals landed against a matrix that was cancelled or
+still running, and no review on those two heads cited a check status.
+`4a32d142` was approved twice while its run sat `in_progress` — on a
+defect that made the suite hang forever on two of the three supported
+runtimes, which is why that run never finished. The last head is what
+the rule looks like when it is followed.
+
+Approving ahead of CI is sometimes right; a fork PR whose workflow needs
+maintainer authorisation cannot go green before someone acts. Then say
+so — *"approved with CI pending, on the following local run"* — so the
+next reader knows the checkmark was not part of the evidence.
+
+### A local run is evidence only for the runtime it ran on
+
+**State the runtime beside the count.** `1543/1543` is not a result;
+`1543/1543 on node v24.11.1` is.
+
+When the package declares an `engines` range, exercise the **floor**
+before approving, not just whatever is on your PATH. A version-specific
+defect is invisible to any number of runs on one version — repetition
+measures flakiness, not portability.
+
+Measured on #296, and reproducible from the PR thread: the full suite
+passed `1543/1543` on node v24.11.1 — repeatedly, and for both
+independent reviewers. On node v20.20.2 all 36 CA tests pass and **the
+process never exits**, because a positive control the tests depend on
+cannot be established below v22.15. `npx node@20 --test` took under a
+minute and would have caught it. `package.json` declares
+`engines: >=18`, and the CI matrix is 18/20/22 — so the runtime that
+everyone measured on was the one runtime CI does not cover.
+
+This is an Evidence Class failure of exactly the shape this section
+exists for: the measurement was real, honestly reported, and certified
+nothing about two thirds of the supported surface. Same family as
+running a genuine TLS handshake through the API production does not
+call.
+
 ### Why this rule exists
 
 On PR #270 the reviewer **endorsed** a claim about agent-id availability
@@ -149,6 +204,123 @@ Two consequences worth internalizing:
 When several reviewers are on one PR, the classes are what make their
 findings cheap to reconcile — *Measured* from one and *Read* from
 another on the same point is a signal, not a contradiction.
+
+## Predicates That Predict Another Program
+
+**When a change decides trust, admission, or rejection — or more
+generally when any predicate's job is to predict another program's
+behavior — the review must run adversarial inputs through the real
+decision path and compare against the oracle production actually uses.
+A code read is not sufficient evidence for a claim about which inputs
+it accepts.**
+
+Two corollaries. They are the load-bearing part; the rule above them
+would not have caught the case that produced it.
+
+- **A. The oracle must be the *same API* production calls, not merely
+  a real one.** A real check through the wrong entry point is a green
+  test that certifies nothing.
+- **B. Before relying on a test as evidence, verify it reaches the
+  shipped code — mutate the code and confirm the test fails.**
+
+**"We have tests" is the most common form the reassurance takes, and
+it is the one that failed here.** Measured on merged `23346ac9`:
+mutating the launcher's CA guard to accept unconditionally left
+`test/proxy-forward-ca.test.mjs` passing **12/12**, because the test
+exercised a hand-copied twin of the logic rather than the shipped
+function. Both reviews cited the suite's pass count; neither established
+that it reached the shipped guard.
+
+### Phrasing
+
+Claims of the form *"conservative, never permissive"* / *"fails
+closed"* / *"cannot accept X"* are universal quantifications over an
+input space. State them **Measured with the input set named**, or
+downgrade to a floor: *"these shapes were checked; the set is not
+known to be complete."*
+
+### Why this rule exists
+
+PR #283's `ca-trust` guard merged with two approvals and independent
+verification of every blocker. It is wrong in **both** directions, and
+both reproduce on `main`:
+
+- **False reject** — `new X509Certificate(block)` runs on every PEM
+  block and the throw escapes; one CRL in a bundle voids the whole
+  file. Rejection is not the safe direction: the fallback drops every
+  sibling CA, which is the failure the contract exists to prevent.
+- **False accept** — `X509Certificate` ignores the PEM label, so our
+  CA relabelled `TRUSTED CERTIFICATE` yields byte-identical DER and
+  passes, while node's loader skips any block not labelled exactly
+  `CERTIFICATE`.
+
+We were not careless. We measured a write→rename race at 0.88 ms over
+5,000 iterations, grepped the rendezvous path, checked file modes —
+**and never fed the guard a realistic bundle.** The shape to watch for
+is *verifying the checkable parts and reasoning about the deciding
+part*, and it is invisible from inside because the deciding function
+usually looks readable.
+
+That predicate shipped in #283 and was still being corrected in #296 —
+two PRs, and the defects above were found after both had been approved.
+When a single function keeps producing new defects after review has
+signed off on it, stop asking whether reviewers were diligent and ask
+whether the design is a model of an oracle that already exists.
+
+### Read the README before reviewing the code
+
+**When a change depends on what some other program does — a runtime, a
+client, an upstream API — read this repo's own README and CHANGELOG
+history for that program before reviewing the diff.** The project's
+accumulated knowledge of it lives there, and a reviewer who skips it
+re-derives from the code alone and will re-derive wrong.
+
+Concretely, and measured against the review bodies themselves: **no
+review on #283 mentions Bun or BoringSSL** (0 of 3 — two written Codex
+rounds and one empty-bodied approval), while both written rounds reason
+about node's `X509Certificate` and node's CA loader. The client stopped
+being node at CC v2.1.113, which is documented in this file, in
+`README.md`, in `CHANGELOG.md`, and is the reason the `NODE_OPTIONS`
+preload was abandoned and this proxy exists in its current form.
+
+The guard documented its own limitation too. It carried the comment
+*"Still only a pre-flight guard, not proof… never that **Node** will
+verify a given leaf with it. Only a handshake shows that, and the
+launcher does not perform one"* (`23346ac:bin/claude-via-proxy.mjs`,
+replaced by #296). That comment was **partly answered and partly
+misread**: #283 round 1 credits the new tests with verifying "the guard
+against real TLS authorization outcomes," so the handshake gap was
+noticed — but the handshake in question ran through `tls.connect({ca})`,
+which is not the API the launcher uses. The limitation was read, and
+answered with the wrong oracle.
+
+The runtime fact stayed unexamined for three further rounds, until it
+was measured directly against the shipped binary.
+
+The failure is not that the fact was hidden. It is that reviewing a
+diff invites reasoning from the diff, and project history is exactly
+the context a diff does not carry.
+
+### The expectations are part of what gets checked
+
+Corollary B says mutate the code to prove the test reaches it. That is
+not sufficient on its own: **when a test asserts what another program
+does, the expectation itself must have come from that program.**
+
+A row in the CA guard's shape table recorded the predicate's own
+behaviour as the expected value. It survived every review that reached
+it, and was found only when @codeslake ran the table against the real
+loader while building #296's oracle — reported on that PR. The suite was
+green throughout.
+
+### Where else it applies
+
+The CA guard is one instance. The unifying property is that **the
+oracle exists and we chose to model it instead of calling it.** Also
+in this class: `git push --dry-run` as a test of a branch ruleset (it
+reports success against a ruleset the server never consulted — read
+`gh api repos/<o>/<r>/rulesets` instead); a schema pre-check ahead of
+a strict parse; any validator predicting a downstream parser.
 
 ## Anti-Bloat Lens (no-directive PRs)
 
