@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
 import { forwardRequest, parseAbsoluteForm } from "./upstream.mjs";
@@ -7,6 +8,8 @@ import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, run
 import { startWatcher } from "./watcher.mjs";
 import { startOAuthRefresher, stopOAuthRefresher } from "./oauth/refresher.mjs";
 import { attachForwardProxy, handleDownloadsAbsolute } from "./forward-proxy.mjs";
+import { sourceFingerprint, PROXY_ROOT } from "./source-fingerprint.mjs";
+import { publishableGates } from "./gate-allowlist.mjs";
 
 // Debug logging — writes to ~/.claude/cache-fix-debug.log (override path with
 // CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
@@ -70,15 +73,17 @@ function collectBody(req) {
 // Returns `headers`: the (possibly extension-mutated) outbound header
 // object. Extensions read/mutate `reqCtx.headers` — added, changed, AND
 // deleted keys — expecting those mutations to reach the real outbound
-// request (auto-1m-guard's strip mode is the standing example). Prior to
-// this fix only `reqCtx.body` was serialized back into `forwardBody`;
-// `reqCtx.headers` was built for extensions to read/mutate but the mutated
-// object was discarded — forwardRequest still read the ORIGINAL
-// `clientReq.headers`, so header mutations never reached the wire.
-// Returning the object itself (not a copy) is what makes deletions visible
-// to the caller too: `{ ...x }` followed by `delete copy.k` naturally drops
-// `k` from the copy, so no special-casing is needed for add/change/delete —
-// plain object semantics carry all three.
+// request (auto-1m-guard's strip mode, deferred-tool-rewrite's beta-token
+// addition). Prior to this fix only `reqCtx.body` was serialized back into
+// `forwardBody`; `reqCtx.headers` was built for extensions to read/mutate
+// but the mutated object was discarded — forwardRequest still read the
+// ORIGINAL `clientReq.headers`, so header mutations never reached the wire
+// (see docs/audits/restart-state-audit.md-adjacent gap notes in
+// deferred-tool-rewrite.mjs's file header). Returning the object here (not
+// a copy) is what makes deletions visible to the caller too: `{ ...x }`
+// followed by `delete copy.k` naturally drops `k` from the copy, so no
+// special-casing is needed for add/change/delete — plain object semantics
+// carry all three.
 async function preForward(clientReq, clientRes, _abortController, extSnapshot, routeName, baseMeta = {}) {
   const rawBody = await collectBody(clientReq);
 
@@ -112,6 +117,20 @@ async function preForward(clientReq, clientRes, _abortController, extSnapshot, r
 
     if (parsed) {
       forwardBody = Buffer.from(JSON.stringify(reqCtx.body));
+      // Fingerprint of what we ACTUALLY send. Captures are recorded
+      // pre-pipeline — that is what makes attribution possible — so nothing
+      // anywhere records our own output. tools/replay.mjs RECONSTRUCTS it by
+      // re-running the pipeline and then assumes the reconstruction is
+      // faithful; nothing has ever checked that assumption, and every verdict
+      // the gate produces rests on it.
+      //
+      // Recorded here rather than in an extension because this is the single
+      // point where the outbound bytes exist, after every extension has run.
+      // A hash, not the body: the corpus already grows quadratically, and the
+      // question is only ever "did the replay reproduce this", which equality
+      // answers.
+      meta._forwardedSha = createHash("sha256").update(forwardBody).digest("hex").slice(0, 16);
+      meta._forwardedBytes = forwardBody.length;
     }
     headers = reqCtx.headers;
   }
@@ -325,6 +344,13 @@ async function handleBootstrap(clientReq, clientRes) {
 // reverse-mode semantics, and a closed forward instance retires its vote
 // instead of haunting later reverse-only instances in the same process.
 let _forwardActive = 0;
+// sha256 over the proxy source tree as loaded at startup; null when it could
+// not be computed. Set once by startProxy, never after — the point is that it
+// describes the code THIS process is running, not the code on disk now.
+let _sourceTree = null;
+// Every CACHE_FIX_* variable this process was started with, snapshotted once
+// for the same reason: it describes what is SERVING, not what is declared.
+let _gates = {};
 
 function handleHealth(_req, res) {
   // Surface extension-load failures so callers (operators, monitoring) see
@@ -355,6 +381,26 @@ function handleHealth(_req, res) {
     version: config.version,
     forward_proxy: _forwardActive > 0,
     https_proxy: (_forwardActive > 0 && config.httpsProxy) || null,
+    // Content fingerprint of the source this process LOADED. Hot-reload is
+    // off, so after an edit without a restart this stays at the old value
+    // while the working tree moves on — which is precisely the drift an
+    // external checker needs to see, and cannot infer from mtimes without
+    // false-firing on every touch that changes no bytes.
+    proxy_tree: _sourceTree,
+    // The gate set this process is ACTUALLY running, snapshotted at startup.
+    //
+    // Same argument as proxy_tree, one layer over: checking the unit file
+    // answers "what is declared", not "what is serving". Edit the unit and
+    // skip the restart and the two diverge silently — every extension reads
+    // its gate from process.env, which is fixed for the life of the process.
+    //
+    // It also gives the offline gate (tools/gate-live.mjs) something better
+    // than the unit to replay against: on 2026-07-28 the gate ran with
+    // extension DEFAULTS while production ran 11 gates, so CACHE_FIX_TOOL_REWRITE
+    // was off in every verification run and on in every served request. The
+    // sweep reported 0 violations; the same corpus under the real gate set
+    // reported 2.
+    gates: _gates,
   }));
 }
 
@@ -544,6 +590,32 @@ export async function startProxy(options = {}) {
   // wedge mitigation), so we require the exact disable token there.
   const hotReloadOptIn = process.env.CACHE_FIX_HOT_RELOAD === "on";
   const watch = options.watch !== false && hotReloadOptIn;
+
+  // Fingerprint the source we are ABOUT TO RUN, before serving anything, so
+  // /health can answer "which bytes is this process actually running" instead
+  // of leaving an external checker to guess from mtimes. Computed here rather
+  // than at module load: this is the moment the answer becomes true, and a
+  // failure to read our own source must not take the proxy down — an unknown
+  // fingerprint reports as null, which a checker can distinguish from a
+  // mismatch.
+  // Allowlisted gate VALUES, every other CACHE_FIX_* key by name only. /health
+  // is served to anything that can reach the port, and the environment holds an
+  // OAuth client id, a token endpoint and a dozen machine paths alongside the
+  // switches. See proxy/gate-allowlist.mjs for why the default is name-only.
+  _gates = publishableGates(process.env);
+  try {
+    _sourceTree = await sourceFingerprint(PROXY_ROOT);
+    // Publish via the environment, NOT via a module export. loadExtensions
+    // cache-busts its imports (pipeline.mjs `_loadCounter`), so the module
+    // instance the pipeline runs is not the one a dynamic import here would
+    // return — module-scope state does not cross that boundary, and a setter
+    // called on the wrong instance leaves the field silently null. Extensions
+    // already read their gates from process.env for the same reason.
+    if (_sourceTree) process.env.CACHE_FIX_PROXY_TREE = _sourceTree;
+  } catch (err) {
+    process.stderr.write(`[cache-fix] source fingerprint unavailable: ${err?.message ?? err}\n`);
+    _sourceTree = null;
+  }
 
   // Boot banner on stderr so the EFFECTIVE hot-reload mode is visible in the
   // supervisor's log (journalctl --user / ~/Library/Logs/) without being
