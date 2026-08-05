@@ -853,3 +853,98 @@ test("v2 session-file merge: cache-telemetry spread writes v2 fields to sessions
     assert.equal(sessionFileContents.tools_hash_baseline, ctx.meta._thinkingSanitizeV2.tools_hash_baseline);
   });
 });
+
+
+// --- planSanitize: position independence (cross-request byte stability) ---
+//
+// v1's protection must be a function of the message's own shape — "is this
+// turn's terminal tool_use answered by a following tool_result" — never of
+// its distance from the tail. The two agree while the continuation IS the
+// latest assistant turn; they diverge the moment another turn lands after
+// it, and the old `i === latestAsst` gate then flipped a byte-identical
+// message from protected to stripped. That is a mid-history mutation the
+// proxy itself causes on every request where a continuation ages out of the
+// tail — measured before the fix: 133 cross-request violations over 563
+// requests on one session, 76 over 169 on another, all attributed to this
+// extension.
+//
+// This is a v1-only claim — the content is OMITTED thinking (v1's target;
+// v2 never touches omitted blocks) and v2StripSigned is left at its default
+// false. Round-1 review (PR #279, 2026-07-31) established that v2 does NOT
+// get this same by-shape protection — see the paired test below.
+test("planSanitize: v1 — an answered tool-continuation stays protected after it ages out of the tail", () => {
+  const continuation = { role: "assistant", content: [omitted(), toolUse("t9")] };
+  const asTail = [
+    { role: "user", content: [text("q")] },
+    continuation,
+    { role: "user", content: [toolResult("t9")] },
+  ];
+  // Same messages, one later exchange appended — the continuation is now
+  // mid-history and a NEWER assistant turn exists behind it.
+  const asMidHistory = [
+    ...asTail,
+    { role: "assistant", content: [text("done")] },
+    { role: "user", content: [text("next")] },
+  ];
+  const tailOut = planSanitize(asTail).messages[1];
+  const midOut = planSanitize(asMidHistory).messages[1];
+  assert.deepEqual(tailOut, continuation, "protected while latest (both gates agree here)");
+  assert.deepEqual(
+    midOut,
+    continuation,
+    "the SAME bytes must stay protected once a later turn exists under v1 — stripping here is a mid-history mutation that re-bills the whole prefix",
+  );
+  assert.equal(
+    JSON.stringify(tailOut),
+    JSON.stringify(midOut),
+    "cross-request byte stability: request N and N+1 must serialize this message identically",
+  );
+});
+
+// v2's contract is the opposite once a continuation ages out of the tail:
+// strip its signed thinking exactly as main did before PR #279, because a
+// v2StripSigned request has already busted the cache prefix on the tools
+// change — protecting deep history there buys nothing and reintroduces the
+// stale-signature risk v2 exists to remove
+// (docs/directives/proxy-thinking-block-sanitize-v2.md:58-67,153-159).
+// Reviewer's own repro (PR #279 round-1 review, 2026-07-31): this must
+// match main's droppedV2:1 behavior, not the PR head's (buggy) droppedV2:0.
+test("planSanitize: v2 — a historical answered continuation loses its signed thinking once it ages out of the tail (not shape-protected)", () => {
+  const continuation = { role: "assistant", content: [realSigned(), toolUse("t9")] };
+  const messages = [
+    { role: "user", content: [text("q")] },
+    continuation, // answered → active continuation, but NOT the latest assistant turn
+    { role: "user", content: [toolResult("t9")] },
+    { role: "assistant", content: [text("done")] }, // later assistant turn
+  ];
+  const r = planSanitize(messages, { v2StripSigned: true });
+  assert.deepEqual(
+    r.messages[1].content,
+    [toolUse("t9")],
+    "signed thinking stripped from the now-historical continuation — matches main",
+  );
+  assert.equal(r.droppedV2, 1);
+});
+
+// The latest active continuation keeps its v2 protection — same case as the
+// existing "v2 onRequest: active-tool-continuation latest turn protected
+// even on mismatch" integration test above, pinned here at the pure-planner
+// level too so the two layers can't drift apart.
+test("planSanitize: v2 — the LATEST active continuation stays protected even with v2StripSigned", () => {
+  const continuation = { role: "assistant", content: [realSigned(), toolUse("t9")] };
+  const messages = [
+    { role: "user", content: [text("q")] },
+    { role: "assistant", content: [realSigned(), text("prior")] },
+    { role: "user", content: [text("q2")] },
+    continuation, // latest assistant turn, answered
+    { role: "user", content: [toolResult("t9")] },
+  ];
+  const r = planSanitize(messages, { v2StripSigned: true });
+  assert.deepEqual(r.messages[1].content, [text("prior")], "prior non-continuation turn stripped");
+  assert.deepEqual(
+    r.messages[3],
+    continuation,
+    "latest active continuation left byte-identical",
+  );
+  assert.equal(r.droppedV2, 1);
+});

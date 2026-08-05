@@ -92,13 +92,19 @@ function answersToolUse(msg, toolUseId) {
   );
 }
 
-// The latest assistant message is an active tool-continuation when its terminal
+// An assistant message is an active tool-continuation when its terminal
 // block is a `tool_use` that is *paired with* — i.e. answered by — a following
 // `tool_result` carrying the same `tool_use_id`. Only then does the API require
 // that turn's thinking intact, so only then must we leave it untouched. Matching
 // the id (not merely the presence of any later tool_result) keeps the guard as
 // narrow as the approved rule: an unanswered terminal tool_use, or a later
 // tool_result that answers a *different* call, is not the protected case.
+//
+// The predicate ITSELF is a function of the message and what follows it, NOT
+// of its distance from the tail — see planSanitize's stability note for why
+// that distinction is load-bearing for v1. (planSanitize additionally scopes
+// v2's use of this predicate to the latest turn only — that's a decision
+// planSanitize makes on top of this predicate, not a change to the predicate.)
 export function isActiveToolContinuation(messages, idx) {
   const msg = messages[idx];
   if (!msg || !Array.isArray(msg.content) || msg.content.length === 0) return false;
@@ -108,13 +114,6 @@ export function isActiveToolContinuation(messages, idx) {
     if (answersToolUse(messages[j], last.id)) return true;
   }
   return false;
-}
-
-function latestAssistantIndex(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i] && messages[i].role === "assistant") return i;
-  }
-  return -1;
 }
 
 // --- v2 predicate ---
@@ -142,10 +141,42 @@ export function isSignedThinkingForV2(block) {
 // `v2StripSigned` is the externally-determined boolean: should v2's
 // signed-thinking drop fire this request? (Caller has already computed
 // hash mismatch + session-state checks.)
+// CROSS-REQUEST BYTE STABILITY (2026-07-28). Protection is decided by the
+// message's own shape — "is this turn's terminal tool_use answered by a
+// following tool_result" — and never by whether it is the LAST assistant
+// turn. The two agree while the turn is at the tail; they diverge the moment
+// another turn lands after it, and the earlier `i === latestAsst` gate then
+// flipped a byte-identical message from protected to stripped. That is a
+// mid-history mutation the proxy itself causes, on every request where a
+// tool-continuation turn ages out of the tail — and a mid-history mutation is
+// exactly what re-writes the cache we exist to preserve. Measured before the
+// fix: 133 violations over 563 requests (session 35d72503) and 76 over 169
+// (session 58c979ce), every one attributed to this extension by
+// tools/replay.mjs's cross-request check.
+//
+// A continuation stays protected once it is deep history — for v1. v1's
+// omitted-thinking drop is empirical: nothing forces us to touch a
+// byte-identical replayed block once it ages out of the tail, and doing so
+// buys nothing (the 400 this extension prevents is about the LATEST turn,
+// #63147) while costing a full re-write.
+//
+// v2 does NOT get the same by-shape protection. v2 fires only on a
+// tools-hash mismatch, which already busts the cache prefix from that point
+// on — so protecting a deep-history continuation's signed thinking there
+// buys zero cache benefit while reintroducing the stale-signature risk v2
+// exists to remove (docs/directives/proxy-thinking-block-sanitize-v2.md:58-67,
+// 153-159; PR #279 round-1 review, 2026-07-31). v2's protection therefore
+// stays tail-scoped: only the LATEST assistant turn, when it is itself an
+// active continuation, is left intact. Any earlier active continuation loses
+// its signed/redacted thinking under v2StripSigned exactly as main did
+// before this patch.
 export function planSanitize(messages, { v2StripSigned = false } = {}) {
   if (!Array.isArray(messages)) return { messages, dropped: 0, droppedV2: 0 };
-  const latestAsst = latestAssistantIndex(messages);
-  const protectLatest = latestAsst >= 0 && isActiveToolContinuation(messages, latestAsst);
+
+  let latestAsst = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i] && messages[i].role === "assistant") latestAsst = i;
+  }
 
   let dropped = 0;
   let droppedV2 = 0;
@@ -157,22 +188,35 @@ export function planSanitize(messages, { v2StripSigned = false } = {}) {
       out.push(msg);
       continue;
     }
-    if (i === latestAsst && protectLatest) {
-      // Active continuation — leave thinking intact (both v1 and v2 respect
-      // this; the API needs the signed thinking for the pending tool call).
+    const activeCont = isActiveToolContinuation(messages, i);
+    // v1: protect by shape, any position — the fix this PR makes.
+    const protectV1 = activeCont;
+    // v2: protect ONLY the latest active continuation — position-scoped,
+    // matching the v2 directive's "strip all prior signed thinking" rule.
+    const protectV2 = activeCont && i === latestAsst;
+
+    if (protectV1 && (!v2StripSigned || protectV2)) {
+      // Either v2 isn't stripping this request, or this message is the one
+      // case v2 also protects (the latest active continuation) — leave the
+      // whole message intact, both gates agree.
       out.push(msg);
       continue;
     }
+
     const kept = msg.content.filter((b) => {
-      // v1 always-active drop predicate.
+      // v1's shape-based protection still applies here even though we fell
+      // through the whole-message shortcut above — that fallthrough can
+      // only happen when protectV1 is true and v2StripSigned is stripping a
+      // deep-history continuation, which must not touch v1's target blocks.
       if (isOmittedThinking(b)) {
+        if (protectV1) return true;
         dropped++;
         return false;
       }
       // v2-only drop predicate. Predicates are mutually exclusive on a single
       // block: omitted thinking matches v1's predicate but not v2's, and
       // signed/redacted thinking matches v2's predicate but not v1's.
-      if (v2StripSigned && isSignedThinkingForV2(b)) {
+      if (v2StripSigned && isSignedThinkingForV2(b) && !protectV2) {
         droppedV2++;
         return false;
       }
