@@ -1,0 +1,33 @@
+{
+  "_comment": "Synthetic minimal repro of the 2026-07-27 14:05 splice shape (docs/directives/proxy-insertion-normalization.md). NOT real session content — built by hand for insertion-normalization.test.mjs. `priorMessages` is the 12-entry canonical history from the prior request (arrival order). `incomingMessages` is the NEXT request's messages[] as Claude Code actually sends it: two new user-role entries (a queued operator message and a task-reminder-shaped system-reminder wrapper) spliced in BETWEEN prior canonical index 9 and 10, instead of appended after index 11 where they causally arrived. Expected: classifyInsertion(incomingMessages, canonicalFromPrior) -> action 'normalized', re-serialized to priorMessages (0..11) followed by the two new entries in their incoming relative order (queued-message, then task-reminder).",
+  "priorMessages": [
+    { "role": "user", "content": [{ "type": "text", "text": "turn0-user: investigate the widget cache" }] },
+    { "role": "assistant", "content": [{ "type": "text", "text": "turn1-assistant: looking into it" }] },
+    { "role": "user", "content": [{ "type": "text", "text": "turn2-user: check the config file" }] },
+    { "role": "assistant", "content": [{ "type": "text", "text": "turn3-assistant: config looks fine" }] },
+    { "role": "user", "content": [{ "type": "text", "text": "turn4-user: run the test suite" }] },
+    { "role": "assistant", "content": [{ "type": "text", "text": "turn5-assistant: tests pass" }] },
+    { "role": "user", "content": [{ "type": "text", "text": "turn6-user: add a regression guard" }] },
+    { "role": "assistant", "content": [{ "type": "text", "text": "turn7-assistant: guard added" }] },
+    { "role": "user", "content": [{ "type": "text", "text": "turn8-user: commit the change" }] },
+    { "role": "assistant", "content": [{ "type": "text", "text": "turn9-assistant: committed" }] },
+    { "role": "user", "content": [{ "type": "text", "text": "turn10-user: what's next on the roadmap" }] },
+    { "role": "assistant", "content": [{ "type": "text", "text": "turn11-assistant: next is the deploy step" }] }
+  ],
+  "incomingMessages": [
+    { "role": "user", "content": [{ "type": "text", "text": "turn0-user: investigate the widget cache" }] },
+    { "role": "assistant", "content": [{ "type": "text", "text": "turn1-assistant: looking into it" }] },
+    { "role": "user", "content": [{ "type": "text", "text": "turn2-user: check the config file" }] },
+    { "role": "assistant", "content": [{ "type": "text", "text": "turn3-assistant: config looks fine" }] },
+    { "role": "user", "content": [{ "type": "text", "text": "turn4-user: run the test suite" }] },
+    { "role": "assistant", "content": [{ "type": "text", "text": "turn5-assistant: tests pass" }] },
+    { "role": "user", "content": [{ "type": "text", "text": "turn6-user: add a regression guard" }] },
+    { "role": "assistant", "content": [{ "type": "text", "text": "turn7-assistant: guard added" }] },
+    { "role": "user", "content": [{ "type": "text", "text": "turn8-user: commit the change" }] },
+    { "role": "assistant", "content": [{ "type": "text", "text": "turn9-assistant: committed" }] },
+    { "role": "user", "content": [{ "type": "text", "text": "queued-message: operator says pause before deploy" }] },
+    { "role": "user", "content": [{ "type": "text", "text": "<system-reminder>\nThe task tools haven't been used recently.\n</system-reminder>" }] },
+    { "role": "user", "content": [{ "type": "text", "text": "turn10-user: what's next on the roadmap" }] },
+    { "role": "assistant", "content": [{ "type": "text", "text": "turn11-assistant: next is the deploy step" }] }
+  ]
+}
