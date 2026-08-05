@@ -460,6 +460,23 @@ async function _processRequest(body, headers, { dir, map, fs }) {
   };
   map.set(nsKey, updated);
 
+  // messages.count grows on every ordinary turn — a conversation living is
+  // not an upstream structural change, and logging it drowned the alarm
+  // file (97% of all recorded events were count-only diffs, measured
+  // 2026-07-30 over 4661 events). A count-only INCREASE updates the stored
+  // fingerprint silently; any OTHER changed path still alarms, with the
+  // count change riding along in its diff if both moved. A count-only
+  // DECREASE (compaction, truncation, an upstream rewrite that drops
+  // messages) still alarms — this detector exists to catch shape changes
+  // we didn't anticipate, and a shrink is exactly that kind of event.
+  const isCountOnlyGrowth =
+    diff.length === 1 &&
+    diff[0].path === "messages.count" &&
+    diff[0].to > diff[0].from;
+  if (isCountOnlyGrowth) {
+    return { event: "noop", nsKey };
+  }
+
   await appendEvent(
     {
       ts,
