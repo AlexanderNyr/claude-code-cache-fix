@@ -1,5 +1,6 @@
 {
   "bootstrap-defense": { "enabled": true, "order": 45 },
+  "output-guard-stash": { "enabled": true, "order": 55 },
   "request-capture": { "enabled": true, "order": 60 },
   "ttl-tier-detect": { "enabled": true, "order": 75 },
   "cc-version-normalize": { "enabled": true, "order": 90 },
@@ -25,6 +26,7 @@
   "overage-warning": { "enabled": true, "order": 610 },
   "upstream-error-log": { "enabled": true, "order": 670 },
   "session-budget-breaker": { "enabled": true, "order": 690 },
+  "output-guard": { "enabled": true, "order": 690 },
   "request-log": { "enabled": false, "order": 700 },
   "jsonl-session-mirror": { "enabled": true, "order": 720 }
 }
