@@ -1,0 +1,35 @@
+{
+  "_comment": "Synthetic fixture, minimal, built from the ledger SHAPE only (measured 2026-07-27 12:47:56, ledger row tools[SendMessage:added], toolsMatch:false) per docs/directives/proxy-deferred-tool-rewrite.md Phase A. Session mirrors were NOT read to build this — only the shape named in the directive (a tools[] array gaining exactly one new entry, SendMessage, mid-conversation).",
+  "prior": {
+    "model": "claude-sonnet-4-6",
+    "system": [{ "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." }],
+    "messages": [
+      { "role": "user", "content": [{ "type": "text", "text": "start a background agent" }] }
+    ],
+    "tools": [
+      { "name": "Read", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } } },
+      { "name": "Bash", "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } } }
+    ]
+  },
+  "incoming": {
+    "model": "claude-sonnet-4-6",
+    "system": [{ "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." }],
+    "messages": [
+      { "role": "user", "content": [{ "type": "text", "text": "start a background agent" }] },
+      { "role": "assistant", "content": [{ "type": "text", "text": "Starting a background agent now." }] },
+      { "role": "user", "content": [{ "type": "text", "text": "ok, keep going" }] }
+    ],
+    "tools": [
+      { "name": "Read", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } } },
+      { "name": "Bash", "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } } },
+      {
+        "name": "SendMessage",
+        "description": "Send a message to a teammate agent.",
+        "input_schema": {
+          "type": "object",
+          "properties": { "to": { "type": "string" }, "message": { "type": "string" } }
+        }
+      }
+    ]
+  }
+}

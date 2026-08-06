@@ -1,0 +1,30 @@
+{
+  "_comment": "Synthetic fixture, minimal, built from the ledger SHAPE only (measured 2026-07-27 15:36, ledger row tools:REMOVE, CronCreate removed + DeferredToolPlaceholder reordered, no ToolSearch nearby; skills-update system events in-window) per docs/directives/robustness-threat-matrix.md row 13. Session mirrors were NOT read to build this — only the shape named in the matrix row (a known tool disappearing from tools[] plus an unrelated reorder, both mid-conversation, with no addition).",
+  "prior": {
+    "model": "claude-sonnet-4-6",
+    "system": [{ "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." }],
+    "messages": [
+      { "role": "user", "content": [{ "type": "text", "text": "schedule a cron job" }] }
+    ],
+    "tools": [
+      { "name": "Read", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } } },
+      { "name": "Bash", "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } } },
+      { "name": "CronCreate", "input_schema": { "type": "object", "properties": { "schedule": { "type": "string" } } } },
+      { "name": "DeferredToolPlaceholder", "input_schema": { "type": "object", "properties": {} } }
+    ]
+  },
+  "incoming": {
+    "model": "claude-sonnet-4-6",
+    "system": [{ "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." }],
+    "messages": [
+      { "role": "user", "content": [{ "type": "text", "text": "schedule a cron job" }] },
+      { "role": "assistant", "content": [{ "type": "text", "text": "Scheduled." }] },
+      { "role": "user", "content": [{ "type": "text", "text": "thanks, what else can you do" }] }
+    ],
+    "tools": [
+      { "name": "DeferredToolPlaceholder", "input_schema": { "type": "object", "properties": {} } },
+      { "name": "Read", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } } },
+      { "name": "Bash", "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } } }
+    ]
+  }
+}
