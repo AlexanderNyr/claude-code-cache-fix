@@ -8,7 +8,7 @@
 >
 > **Note:** This translation is machine-assisted and may lag the English README. For anything authoritative, see [README.md](./README.md). Corrections are very welcome — please open a PR.
 
-Proxy d'optimisation du cache pour [Claude Code](https://github.com/anthropics/claude-code). Corrige les bogues du cache de prompts qui entraînent une consommation excessive de quotas, stabilise le préfixe des requêtes et surveille les régressions silencieuses. Fonctionne avec toutes les versions de CC, y compris le binaire Bun v2.1.113+.
+Proxy d'optimisation du cache pour [Claude Code](https://github.com/anthropics/claude-code). Corrige les bogues du prompt cache qui entraînent une consommation excessive du quota, stabilise le préfixe de requête et surveille les régressions silencieuses. Fonctionne avec toutes les versions de CC, y compris le binaire Bun v2.1.113+.
 
 *Ce README documente la branche `main` actuelle ; la disponibilité des versions est notée par fonctionnalité.*
 
@@ -17,28 +17,28 @@ Proxy d'optimisation du cache pour [Claude Code](https://github.com/anthropics/c
 Un proxy local se place entre Claude Code et Anthropic. Avant de continuer la lecture, voici exactement ce que cela signifie — le traitement complet se trouve dans [Modèle de sécurité](#modèle-de-sécurité).
 
 - **Se lie à `127.0.0.1`** par défaut.
-- **Transmet le trafic de Claude Code à Anthropic. Sur le chemin par défaut, il n'effectue aucun autre appel sortant** — la télémétrie est écrite dans des fichiers locaux sous `~/.claude/`, jamais envoyée nulle part. Deux fonctionnalités optionnelles effectuent leurs propres appels sortants, toutes deux désactivées sauf si vous les activez : le rafraîchissement OAuth (`CACHE_FIX_OAUTH_REFRESH=on`) envoie vers le point de terminaison des jetons d'Anthropic, et l'accélération de téléchargement via proxy forward réémet les téléchargements de versions vers `downloads.claude.ai` / `storage.googleapis.com`.
+- **Transmet le trafic de Claude Code à Anthropic. Sur le chemin par défaut, il n'effectue aucun autre appel sortant** — la télémétrie est écrite dans des fichiers locaux sous `~/.claude/`, jamais envoyée nulle part. Deux fonctionnalités optionnelles effectuent leurs propres appels sortants, toutes deux désactivées sauf si vous les activez : le rafraîchissement OAuth (`CACHE_FIX_OAUTH_REFRESH=on`) envoie vers le endpoint de tokens d’Anthropic, et l'accélération de téléchargement via le forward proxy réémet les téléchargements de versions vers `downloads.claude.ai` / `storage.googleapis.com`.
 - **Peut lire et réécrire `POST /v1/messages`.** Cette capacité *est* la réparation du cache — il n'existe aucune version de ceci qui fonctionne sans elle.
-- **Elle est idempotente : si rien ne nécessite de correction, la requête passe non modifiée.** Elle normalise la structure de la requête (ordre des blocs, empreinte, TTL) ; elle ne modifie pas votre conversation.
+- **La transformation est idempotente : si aucune correction n’est nécessaire, la requête est transmise sans modification.** Elle normalise la structure de la requête (ordre des blocs, empreinte, TTL) ; elle ne modifie pas votre conversation.
 - **Chaque transformation est un fichier** dans `proxy/extensions/`, lisible de manière isolée.
 - [Évalué indépendamment comme un outil légitime](https://github.com/anthropics/claude-code/issues/38335#issuecomment-4244413605) par @TheAuditorTool (2026-04-14).
 
-Le mode proxy forward (`--remote-control`) termine en plus le TLS pour `api.anthropic.com` en utilisant une CA générée localement, que votre client doit faire confiance. Tout le reste est tunnelé à l'aveugle. Ce mode est optionnel et désactivé par défaut.
+Le mode forward proxy (`--remote-control`) termine en plus le TLS pour `api.anthropic.com` à l’aide d’une autorité de certification (CA) générée localement, à laquelle votre client doit faire confiance. Tout le reste transite sans être inspecté. Ce mode est optionnel et désactivé par défaut.
 
 ## En avez-vous besoin ?
 
-**Installez ou testez-le si :** les sessions reprises ou de longue durée montrent des pics répétés de `cache_creation_input_tokens` ; votre ratio de lecture du cache est faible ou instable ; vous voyez des rétrogradations TTL 5m inattendues, des erreurs `400` de désynchronisation de réflexion, ou des tempêtes de tentatives d'images ; ou si l'une des surfaces non-cache documentées ci-dessous s'applique.
+**Installez ou testez-le si :** les sessions reprises ou de longue durée montrent des pics répétés de `cache_creation_input_tokens` ; votre ratio de lecture du cache est faible ou instable ; vous voyez des passages inattendus à un TTL de 5 min, des erreurs `400` de désynchronisation des blocs Thinking ou des boucles de nouvelles tentatives liées aux images ; ou si l’une des fonctionnalités sans rapport avec le cache décrites ci-dessous vous concerne.
 
 **Vous pouvez l'ignorer si :** vos sessions maintiennent déjà un ratio de lecture du cache stable et élevé ; vous reprenez rarement des sessions longues ; vous n'êtes pas sous pression de quota ; ou vous préférez ne pas placer un proxy local dans le chemin API. **Les quatre sont de bonnes raisons de ne pas installer ceci.**
 
-Si vous n'êtes pas sûr de laquelle s'applique, mesurez-le — vous n'avez pas besoin de ce projet installé pour le découvrir.
+Si vous ne savez pas dans quel cas vous vous trouvez, mesurez-le — vous n'avez pas besoin de ce projet installé pour le découvrir.
 
 ## Vérifier si vous avez ce problème
 
 Claude Code enregistre déjà la comptabilité du cache par requête dans ses propres transcriptions de session, vous pouvez donc mesurer la santé de votre cache maintenant, avant d'installer quoi que ce soit.
 
 ```bash
-# Remplacez <session-uuid>, ou utilisez un glob pour sélectionner votre session la plus récente.
+# Replace <session-uuid>, or use a glob to pick your most recent session.
 jq -r 'select(.message.usage.cache_read_input_tokens != null) |
   "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
   ~/.claude/projects/*/<session-uuid>.jsonl |
@@ -58,41 +58,41 @@ Lecture du résultat :
 
 ## Avis actuels
 
-> **v4.0.0** — Proxy HTTP local avec un pipeline d'extensions d'impact sur les coûts et d'observabilité. Deux paramètres par défaut de longue date ont été inversés : `thinking-block-sanitize` v1 est activé par défaut (atténue le blocage `400` de désynchronisation de réflexion — [#63147](https://github.com/anthropics/claude-code/issues/63147)) et le rechargement à chaud des extensions en processus est optionnel (`CACHE_FIX_HOT_RELOAD=on`). A/B baseline (v3.0.0 sur v2.1.117) : **95,5% de taux de cache hit via proxy vs 82,3% en direct** sur le premier tour chaud. [Notes de version complètes →](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v4.0.0)
+> **v4.0.0** — Proxy HTTP local avec un pipeline d’extensions dédiées à l’optimisation des coûts et à l’observabilité. Deux paramètres par défaut de longue date ont été inversés : `thinking-block-sanitize` v1 est activé par défaut (atténue le blocage `400` de désynchronisation des blocs Thinking — [#63147](https://github.com/anthropics/claude-code/issues/63147)) et le rechargement à chaud des extensions dans le processus est optionnel (`CACHE_FIX_HOT_RELOAD=on`). Mesure de référence A/B (v3.0.0 sur v2.1.117) : **95,5 % de cache hits via le proxy, contre 82,3 % en accès direct** au premier tour après warm-up. [Notes de version complètes →](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v4.0.0)
 
-> **Avis Opus 4.7 :** Les données mesurées montrent que 4.7 brûle le quota Q5h à **~2,4x le taux de 4.6** pour des nombres de tokens visibles équivalents ([confirmé indépendamment par @ArkNill](https://github.com/ArkNill/claude-code-hidden-problem-analysis/blob/main/16_OPUS-47-ADVISORY.md)). Deux facteurs : un nouveau tokeniseur (jusqu'à 35% de tokens en plus, [documenté](https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7)) et le surcoût de la réflexion adaptative (~105%, non documenté dans la réponse d'utilisation). L'impact Q5h se cumule dans le **Q7d** — le plafond hebdomadaire que la plupart des utilisateurs intensifs atteindront en premier. Solution de contournement : `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` réduit la consommation d'environ 3,3x mais peut réduire la qualité sur les tâches complexes. Voir [Discussion #25](https://github.com/cnighswonger/claude-code-cache-fix/discussions/25) (observation initiale) et [Discussion #42](https://github.com/cnighswonger/claude-code-cache-fix/discussions/42) (données A/B contrôlées + analyse Q7d).
+> **Avis Opus 4.7 :** Les données mesurées montrent que 4.7 consomme le quota Q5h à un rythme **environ 2,4 fois supérieur à celui de 4.6** à nombre de tokens visibles équivalent ([confirmé indépendamment par @ArkNill](https://github.com/ArkNill/claude-code-hidden-problem-analysis/blob/main/16_OPUS-47-ADVISORY.md)). Deux facteurs : un nouveau tokenizer (jusqu’à 35 % de tokens en plus, [documenté](https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7)) et le surcoût de l’adaptive thinking (~105 %, non documenté dans la réponse d'utilisation). L'impact Q5h se cumule dans le **Q7d** — le plafond hebdomadaire que la plupart des utilisateurs intensifs atteindront en premier. Solution de contournement : `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` réduit la consommation d’environ 3,3× mais peut réduire la qualité sur les tâches complexes. Voir [Discussion #25](https://github.com/cnighswonger/claude-code-cache-fix/discussions/25) (observation initiale) et [Discussion #42](https://github.com/cnighswonger/claude-code-cache-fix/discussions/42) (données A/B contrôlées + analyse Q7d).
 
 ## Démarrage rapide : Proxy (recommandé)
 
-Le proxy fonctionne avec toute version de CC — Node.js ou binaire Bun. Il se place entre Claude Code et l'API Anthropic, appliquant les corrections du cache sous forme d'extensions composable.
+Le proxy fonctionne avec toute version de CC — Node.js ou binaire Bun. Il se place entre Claude Code et l'API Anthropic, appliquant les corrections du cache sous forme d’extensions composables.
 
 ```bash
-# Installer
+# Install
 npm install -g claude-code-cache-fix
 
-# Démarrer le proxy (s'exécute sur localhost:9801)
+# Start the proxy (runs on localhost:9801)
 node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
 
-# Lancer Claude Code à travers le proxy
+# Launch Claude Code through it
 ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
 ```
 
-C'est tout. Le proxy applique son pipeline d'extensions par défaut automatiquement. Pas de scripts enveloppeur, pas de `NODE_OPTIONS`, pas de préchargement.
+C'est tout. Le proxy applique son pipeline d'extensions par défaut automatiquement. Pas de scripts d’encapsulation, pas de `NODE_OPTIONS`, pas de préchargement.
 
-### Mode proxy forward (conserve le fonctionnement de Remote Control)
+### Mode forward proxy (conserve le fonctionnement de Remote Control)
 
-Le démarrage rapide ci-dessus est le **mode proxy inverse** : vous pointez `ANTHROPIC_BASE_URL` vers le proxy. C'est simple, mais sur Claude Code **>= 2.1.196**, un `ANTHROPIC_BASE_URL` non-Anthropic **désactive Remote Control** (`/remote-control`), `/schedule` et les connecteurs MCP de claude.ai (CC traite toute URL de base personnalisée comme une passerelle Bedrock/Vertex). Si vous dépendez de ces fonctionnalités, utilisez le mode proxy forward.
+Le démarrage rapide ci-dessus utilise le **mode reverse proxy** : vous pointez `ANTHROPIC_BASE_URL` vers le proxy. C'est simple, mais sur Claude Code **>= 2.1.196**, un `ANTHROPIC_BASE_URL` non-Anthropic **désactive Remote Control** (`/remote-control`), `/schedule` et les connecteurs MCP de claude.ai (CC traite toute URL de base personnalisée comme une passerelle Bedrock/Vertex). Si vous dépendez de ces fonctionnalités, utilisez le mode forward proxy.
 
-En **mode proxy forward**, le proxy se place devant le *vrai* `api.anthropic.com` en tant que `HTTPS_PROXY`. L'URL de base de Claude Code reste `api.anthropic.com`, donc Remote Control continue de fonctionner, tandis que le proxy voit et transforme toujours `/v1/messages`.
+En **mode forward proxy**, le proxy se place devant le *vrai* `api.anthropic.com` en tant que `HTTPS_PROXY`. L'URL de base de Claude Code reste `api.anthropic.com`, donc Remote Control continue de fonctionner, tandis que le proxy voit et transforme toujours `/v1/messages`.
 
 ```bash
-# Démarrer le proxy en mode forward
+# Start the proxy in forward-proxy mode
 CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-# Il affiche les deux variables d'environnement pour connecter le client, par ex. :
+# It prints the two env vars to wire the client, e.g.:
 #   export HTTPS_PROXY=http://127.0.0.1:9801
 #   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
 
-# Lancer Claude Code à travers le proxy (laissez ANTHROPIC_BASE_URL NON DÉFINI)
+# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
 HTTPS_PROXY=http://127.0.0.1:9801 \
 NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
   claude
@@ -101,18 +101,18 @@ NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
 Ou laissez le lanceur faire les deux étapes pour vous avec `--remote-control` :
 
 ```bash
-# Lance le proxy avec CACHE_FIX_FORWARD_PROXY=on et connecte le client
-# (HTTPS_PROXY + la CA MITM, ANTHROPIC_BASE_URL laissé non défini) automatiquement.
+# Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
+# (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
 cache-fix-proxy --remote-control
 ```
 
-Le drapeau `--remote-control` est l'équivalent en une commande du câblage manuel ci-dessus : il démarre le proxy en mode forward, attend la CA, et lance `claude` pointé sur `HTTPS_PROXY` avec `NODE_EXTRA_CA_CERTS` défini (et ajoute `127.0.0.1,localhost,::1` à `NO_PROXY` pour que les services locaux — par ex. les serveurs MCP HTTP/SSE-transport sur localhost — contournent le proxy au lieu d'être routés vers lui ; tout `NO_PROXY` existant est préservé). Sans le drapeau, le lanceur reste en mode proxy inverse (définit `ANTHROPIC_BASE_URL`), inchangé.
+L’option `--remote-control` est l'équivalent en une commande du câblage manuel ci-dessus : il démarre le proxy en mode forward, attend la CA, et lance `claude` pointé sur `HTTPS_PROXY` avec `NODE_EXTRA_CA_CERTS` défini (et ajoute `127.0.0.1,localhost,::1` à `NO_PROXY` pour que les services locaux — par ex. les serveurs MCP HTTP/SSE-transport sur localhost — contournent le proxy au lieu d'être routés vers lui ; tout `NO_PROXY` existant est préservé). Sans cette option, le lanceur reste en mode reverse proxy (définit `ANTHROPIC_BASE_URL`), inchangé.
 
-> Si vous câblez le mode proxy forward manuellement (en définissant `HTTPS_PROXY` vous-même au lieu d'utiliser `--remote-control`), définissez aussi `NO_PROXY=127.0.0.1,localhost,::1`, sinon les serveurs MCP HTTP-transport locaux et autres services localhost seront routés vers le proxy cache-fix et échoueront.
+> Si vous câblez le mode forward proxy manuellement (en définissant `HTTPS_PROXY` vous-même au lieu d'utiliser `--remote-control`), définissez aussi `NO_PROXY=127.0.0.1,localhost,::1`, sinon les serveurs MCP HTTP-transport locaux et autres services localhost seront routés vers le proxy cache-fix et échoueront.
 
-Comment ça fonctionne : le proxy gère aussi le HTTP `CONNECT`. Il MITM **uniquement** l'hôte amont (`api.anthropic.com`), terminant le TLS avec une CA générée localement pour pouvoir exécuter le même pipeline d'extensions, et **tunnel à l'aveugle tous les autres CONNECT** (mcp-proxy, télémétrie, npm, ...). Au premier démarrage, il génère une CA sous `$CLAUDE_CONFIG_DIR/cache-fix-ca/` (par défaut `~/.claude/cache-fix-ca/` ; surchargeable via `CACHE_FIX_CA_DIR`) ; le client doit lui faire confiance via `NODE_EXTRA_CA_CERTS`. Un WebSocket/Upgrade vers l'hôte amont (par ex. `/voice`) est relayé tel quel.
+Comment ça fonctionne : le proxy gère aussi le HTTP `CONNECT`. Il MITM **uniquement** l'hôte amont (`api.anthropic.com`), terminant le TLS avec une CA générée localement pour pouvoir exécuter le même pipeline d'extensions, et **fait transiter tous les autres tunnels `CONNECT` sans les inspecter** (mcp-proxy, télémétrie, npm, ...). Au premier démarrage, il génère une CA sous `$CLAUDE_CONFIG_DIR/cache-fix-ca/` (par défaut `~/.claude/cache-fix-ca/` ; surchargeable via `CACHE_FIX_CA_DIR`) ; le client doit lui faire confiance via `NODE_EXTRA_CA_CERTS`. Un WebSocket/Upgrade vers l'hôte amont (par ex. `/voice`) est relayé tel quel.
 
-L'enchaînement de proxy d'entreprise fonctionne de la même manière : définissez `HTTPS_PROXY`/`HTTP_PROXY` pour la sortie amont **propre** du proxy.
+Le chaînage avec un proxy d’entreprise fonctionne de la même manière : définissez `HTTPS_PROXY`/`HTTP_PROXY` pour les connexions sortantes du proxy lui-même.
 
 ### Exécution en tant que service
 
@@ -132,8 +132,8 @@ La sortie affiche les commandes de l'étape suivante pour activer et démarrer l
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now cache-fix-proxy
-systemctl --user enable --now cache-fix-proxy-healthcheck.timer   # auto-récupération
-sudo loginctl enable-linger $USER   # optionnel : démarrer au démarrage, pas seulement à la connexion
+systemctl --user enable --now cache-fix-proxy-healthcheck.timer   # auto-recovery — see below
+sudo loginctl enable-linger $USER   # optional: start on boot, not just on login
 ```
 
 **Auto-récupération (Linux) :** `install-service` dépose aussi un compagnon de vérification de santé (`cache-fix-proxy-healthcheck.service` + `.timer`). Le timer se déclenche toutes les 2 minutes ; le service oneshot exécute `curl -fs http://127.0.0.1:<port>/health` et `systemctl --user start cache-fix-proxy.service` si la sonde échoue.
@@ -163,7 +163,7 @@ docker run -d --name cache-fix-proxy \
   -p 9801:9801 \
   ghcr.io/cnighswonger/claude-code-cache-fix:latest
 
-# Puis dans votre shell :
+# Then in your shell:
 export ANTHROPIC_BASE_URL=http://127.0.0.1:9801
 ```
 
@@ -185,8 +185,8 @@ Tous les paramètres du proxy sont contrôlés via des variables d'environnement
 | `CACHE_FIX_PROXY_PORT` | `9801` | Port d'écoute |
 | `CACHE_FIX_PROXY_BIND` | `127.0.0.1` | Adresse de liaison |
 | `CACHE_FIX_PROXY_UPSTREAM` | `https://api.anthropic.com` | URL amont. Changez pour chaîner un autre proxy |
-| `CACHE_FIX_FORWARD_PROXY` | non défini | Définir à `on` pour le mode proxy forward |
-| `CACHE_FIX_CA_DIR` | `~/.claude/cache-fix-ca` | Répertoire pour la CA du proxy forward |
+| `CACHE_FIX_FORWARD_PROXY` | non défini | Définir à `on` pour le mode forward proxy |
+| `CACHE_FIX_CA_DIR` | `~/.claude/cache-fix-ca` | Répertoire de la CA du forward proxy |
 | `CACHE_FIX_PROXY_TIMEOUT` | `600000` | Délai d'expiration de la requête en millisecondes |
 | `CACHE_FIX_EXTENSIONS_DIR` | `proxy/extensions/` | Répertoire des fichiers d'extension `.mjs` |
 | `CACHE_FIX_EXTENSIONS_CONFIG` | `proxy/extensions.json` | Fichier de configuration des extensions |
@@ -220,13 +220,13 @@ curl http://127.0.0.1:9801/health
 
 Le mode par défaut de l'extension `bootstrap-defense` est `audit` : les réponses bootstrap passent par le proxy vers CC et sont journalisées dans `~/.claude/cache-fix-bootstrap-log.jsonl`. Options `block` (bloque complètement) et `allowlist` (filtrage par clé) disponibles via `CACHE_FIX_BOOTSTRAP_MODE`.
 
-**Protection automatique contre le dépassement de contexte 1M.** CC v2.1.161 et suivants peuvent sélectionner automatiquement le contexte 1M sans demande de l'utilisateur. L'extension `auto-1m-guard` du proxy détecte le jeton `context-1m-2025-08-07` et peut avertir ou le supprimer via `CACHE_FIX_AUTO_1M_GUARD` :
+**Protection automatique contre le dépassement de contexte 1M.** CC v2.1.161 et suivants peuvent sélectionner automatiquement le contexte 1M sans demande de l'utilisateur. L'extension `auto-1m-guard` du proxy détecte le token `context-1m-2025-08-07` et peut avertir ou le supprimer via `CACHE_FIX_AUTO_1M_GUARD` :
 
 | Mode | Défaut | Comportement |
 |------|--------|--------------|
 | `off` | non | Extension inactive |
-| `warn` | oui | Détecte le jeton, journalise, ne modifie pas la requête |
-| `strip` | optionnel | Détecte ET supprime le jeton de l'en-tête `anthropic-beta` |
+| `warn` | oui | Détecte le token, journalise, ne modifie pas la requête |
+| `strip` | optionnel | Détecte ET supprime le token de l'en-tête `anthropic-beta` |
 
 ## Hooks côté client
 
@@ -252,7 +252,7 @@ Le proxy corrige ce qu'il peut corriger au niveau de la requête. Quelques varia
 }
 ```
 
-**`CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP=1`** — le drapeau le plus impactant. CC a un chemin de code hérité qui remap silencieusement votre modèle épinglé vers un autre après certaines mises à jour de version. Le définir à `1` désactive le remappage.
+**`CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP=1`** — le paramètre le plus important. CC a un chemin de code hérité qui remap silencieusement votre modèle épinglé vers un autre après certaines mises à jour de version. Le définir à `1` désactive le remappage.
 
 **`ANTHROPIC_MODEL`** — épingle le modèle principal. Garder ceci explicite signifie que le hash du préfixe du cache reste stable.
 
@@ -268,7 +268,7 @@ Ce ne sont pas des bogues que cache-fix corrige — ce sont des comportements CC
 
 ### Les commandes slash de diagnostic gonflent l'historique de conversation ([#49335](https://github.com/anthropics/claude-code/issues/49335))
 
-Exécuter `/context`, `/release-notes` (et probablement d'autres commandes d'inspection d'état) ajoute la sortie de diagnostic à l'historique de la conversation au lieu de le rendre uniquement dans le terminal. Les tours suivants rejouent la charge gonflée via le cache de prompt, augmentant le coût en tokens. Mesuré empiriquement à +3 480 `cache_creation_input_tokens` pour un seul appel `/context` sur v2.1.148.
+Exécuter `/context`, `/release-notes` (et probablement d'autres commandes d'inspection d'état) ajoute la sortie de diagnostic à l'historique de la conversation au lieu de le rendre uniquement dans le terminal. Les tours suivants rejouent la charge gonflée via le prompt cache, augmentant le coût en tokens. Mesuré empiriquement à +3 480 `cache_creation_input_tokens` pour un seul appel `/context` sur v2.1.148.
 
 **Solution de contournement :** utilisez ces commandes avec parcimonie dans les longues sessions. `/compact` après un diagnostic pour réinitialiser la fuite.
 
@@ -308,13 +308,13 @@ L'[extension VS Code](https://github.com/cnighswonger/claude-code-cache-fix-vsco
 
 **Ce qu'il NE fait pas :** Aucun appel réseau depuis le proxy ou l'intercepteur. Toute la télémétrie est écrite dans des fichiers locaux sous `~/.claude/`. Aucune donnée ne quitte votre machine.
 
-**Chaîne d'approvisionnement :** Mode proxy : petits modules d'extension ciblés dans `proxy/extensions/` (la plupart de quelques centaines de lignes ; le pipeline est composable). Mode préchargement : un seul fichier non minifié (`preload.mjs`). Une dépendance de développement (`zod` uniquement pour la validation de schéma dans les tests). Revoyez avant d'installer.
+**Chaîne d'approvisionnement :** Mode proxy : petits modules d'extension ciblés dans `proxy/extensions/` (la plupart de quelques centaines de lignes ; le pipeline est modulaire). Mode préchargement : un seul fichier non minifié (`preload.mjs`). Une dépendance de développement (`zod` uniquement pour la validation de schéma dans les tests). Revoyez avant d'installer.
 
 **Audit indépendant :** [Évalué comme « OUTIL LÉGITIME »](https://github.com/anthropics/claude-code/issues/38335#issuecomment-4244413605) par @TheAuditorTool (2026-04-14).
 
 ## Le problème
 
-Quand vous utilisez `--resume` ou `/resume` dans Claude Code, le cache de prompt se casse silencieusement. Au lieu de lire les tokens en cache (bon marché), l'API les reconstruit à zéro à chaque tour (coûteux). Une session qui devrait coûter ~0,50$/heure peut brûler 5 à 10$/heure sans indication visible que quelque chose ne va pas.
+Quand vous utilisez `--resume` ou `/resume` dans Claude Code, le prompt cache se casse silencieusement. Au lieu de lire les tokens en cache (bon marché), l'API les reconstruit à zéro à chaque tour (coûteux). Une session qui devrait coûter ~0,50$/heure peut brûler 5 à 10$/heure sans indication visible que quelque chose ne va pas.
 
 Trois bogues causent ceci :
 
@@ -328,7 +328,7 @@ De plus, les images lues via l'outil Read persistent en base64 dans l'historique
 
 ## Comment ça fonctionne
 
-**Mode proxy** (v3.0.0+) : Un serveur HTTP sur `localhost:9801` intercepte les requêtes `POST /v1/messages`. Un pipeline de modules d'extension traite chaque requête — normalisant l'ordre des blocs, supprimant les empreintes, stabilisant le tri des outils, gérant les marqueurs TTL, assainissant les blocs de réflexion, enregistrant la télémétrie, et plus. Les extensions vivent comme fichiers `.mjs` configurés dans `proxy/extensions.json` et sont chargées une fois au démarrage du proxy.
+**Mode proxy** (v3.0.0+) : Un serveur HTTP sur `localhost:9801` intercepte les requêtes `POST /v1/messages`. Un pipeline de modules d'extension traite chaque requête — normalisant l'ordre des blocs, supprimant les empreintes, stabilisant le tri des outils, gérant les marqueurs TTL, assainissant les blocs Thinking, enregistrant la télémétrie, et plus. Les extensions vivent comme fichiers `.mjs` configurés dans `proxy/extensions.json` et sont chargées une fois au démarrage du proxy.
 
 **Mode préchargement** (v2.x) : Un module Node.js `--import` qui corrige `globalThis.fetch` avant que Claude Code ne fasse des appels API. Applique les mêmes corrections en ligne.
 
@@ -341,7 +341,7 @@ Le paquet sert à trois objectifs avec des cycles de vie différents :
 | Objectif | Exemples | Quand désactiver |
 |----------|----------|------------------|
 | **Corrections de bogues** | Relocalisation des blocs, empreinte, tri des outils, TTL | Quand CC corrige le bogue sous-jacent — vérifiez la ligne de santé |
-| **Surveillance** | Suivi des quotas, détection microcompact, drapeaux GrowthBook | Garder indéfiniment — détecte les futures régressions |
+| **Surveillance** | Suivi des quotas, détection microcompact, feature flags GrowthBook | Garder indéfiniment — détecte les futures régressions |
 | **Optimisations** | Suppression d'images, réécriture d'efficacité | Tant qu'elles aident votre flux de travail |
 
 ### État de santé (mode préchargement)
@@ -429,25 +429,30 @@ export CACHE_FIX_IMAGE_KEEP_LAST=3
 
 Conserve les images des 3 derniers messages utilisateur, remplace les plus anciennes par un texte de remplacement.
 
-## Résumés de réflexion (mode proxy, optionnel, Opus 4.7+)
+## Résumés du Thinking (mode proxy, optionnel, Opus 4.7+)
 
-Sur Opus 4.7, Anthropic a inversé la valeur par défaut de l'API pour `thinking.display` de `« summarized »` à `« omitted »`. Cette extension injecte le mode configuré à la limite de l'API quand une requête vers un endpoint Opus 4.7 a la réflexion activée mais `display` non défini.
+Sur Opus 4.7, Anthropic a inversé la valeur par défaut de l'API pour `thinking.display` de `« summarized »` à `« omitted »`. Cette extension injecte le mode configuré à la limite de l'API quand une requête vers un endpoint Opus 4.7 a le Thinking activé mais `display` non défini.
 
 ```sh
-export CACHE_FIX_THINKING_DISPLAY=summarized   # Restaurer les résumés (défaut)
-export CACHE_FIX_THINKING_DISPLAY=omitted       # Suppression forcée
-export CACHE_FIX_THINKING_DISPLAY=disabled       # Désactiver l'extension
+# Restore summaries (the built-in default — non-interactive surfaces get reasoning content)
+export CACHE_FIX_THINKING_DISPLAY=summarized
+
+# Force-suppress override (agent runtimes that don't want thinking blocks at all)
+export CACHE_FIX_THINKING_DISPLAY=omitted
+
+# Explicit no-op (extension passes through unchanged)
+export CACHE_FIX_THINKING_DISPLAY=disabled
 ```
 
-## Assainissement des blocs de réflexion (mode proxy, activé par défaut)
+## Nettoyage des blocs Thinking (mode proxy, activé par défaut)
 
-Sur les chemins de rejeu d'historique (reprise / `--continue` / auto-compaction), Claude Code renvoie les réflexions étendues des tours assistant précédents sous forme omise. L'API rejette les réflexions modifiées dans le dernier message assistant avec un `400` permanent. L'extension `thinking-block-sanitize` supprime ces blocs omis avant le transfert.
+Sur les chemins de rejeu d'historique (reprise / `--continue` / auto-compaction), Claude Code renvoie les blocs d’extended thinking des tours assistant précédents sous forme omise. L'API rejette les blocs Thinking modifiés dans le dernier message assistant avec un `400` permanent. L'extension `thinking-block-sanitize` supprime ces blocs omis avant le transfert.
 
 **Activé par défaut depuis v4.0.0.** `CACHE_FIX_THINKING_SANITIZE=off` pour désactiver explicitement.
 
 ## Surveillance et diagnostics
 
-L'intercepteur de préchargement inclut la surveillance de la dégradation microcompact, des faux limiteurs de débit, de l'état des drapeaux GrowthBook, de la télémétrie d'utilisation et des rapports de coûts.
+L'intercepteur de préchargement inclut la surveillance de la dégradation microcompact, des faux limiteurs de débit, de l'état des feature flags GrowthBook, de la télémétrie d'utilisation et des rapports de coûts.
 
 Consultez [docs/monitoring.md](docs/monitoring.md) pour les détails complets, le mode débogage, les variables d'environnement et l'outil d'analyse de quotas.
 
@@ -461,7 +466,7 @@ Consultez [docs/monitoring.md](docs/monitoring.md) pour les détails complets, l
 
 ## Recherches connexes
 
-- **[@ArkNill/claude-code-hidden-problem-analysis](https://github.com/ArkNill/claude-code-hidden-problem-analysis)** — Analyse basée sur 38 996 requêtes via proxy : 7 bogues, test causal des drapeaux de fonctionnalités GrowthBook, avis sur le taux de consommation Opus 4.7.
+- **[@ArkNill/claude-code-hidden-problem-analysis](https://github.com/ArkNill/claude-code-hidden-problem-analysis)** — Analyse basée sur 38 996 requêtes via proxy : 7 bogues, test causal des feature flags GrowthBook, avis sur le taux de consommation Opus 4.7.
 - **[@Renvect/X-Ray-Claude-Code-Interceptor](https://github.com/Envect/X-Ray-Claude-Code-Interceptor)** — Proxy HTTPS de diagnostic avec tableau de bord en temps réel, diffing des sections du prompt système.
 - **[@fgrosswig/claude-usage-dashboard](https://github.com/fgrosswig/claude-usage-dashboard)** — Tableau de bord d'investigation auto-hébergé avec surveillance SSE en direct, agrégation multi-hôtes.
 
@@ -476,14 +481,14 @@ Consultez [docs/monitoring.md](docs/monitoring.md) pour les détails complets, l
 - **[@bilby91](https://github.com/bilby91)** ([Crunchloop DAP](https://dap.crunchloop.ai)) — Validation de l'environnement de production Agent SDK / DAP, conception et contribution de la fabrique de proxy embarquée
 - **[@jmarianski](https://github.com/jmianski)** — Analyse des causes profondes via capture proxy MITM et rétro-ingénierie Ghidra
 - **[@cnighswonger](https://github.com/cnighswonger)** — Stabilisation de l'empreinte, correction du tri des outils, suppression d'images, fonctionnalités de surveillance, architecture proxy, mainteneur du paquet
-- **[@ArkNill](https://github.com/ArkNill)** — Analyse du mécanisme microcompact, documentation des drapeaux GrowthBook, README coréen (PR #22)
+- **[@ArkNill](https://github.com/ArkNill)** — Analyse du mécanisme microcompact, documentation des feature flags GrowthBook, README coréen (PR #22)
 - **[@Renvect](https://github.com/Renvect)** — Découverte de la duplication d'images
 - **[@fgrosswig](https://github.com/fgrosswig)** — Méthodologie du tableau de bord d'usage Claude
 - **[@TomTheMenace](https://github.com/TomTheMenace)** — Wrapper `.bat` Windows, première validation de plateforme Windows
 - **[@deafsquad](https://github.com/deafsquad)** — Correction universelle smoosh_split, architecture proxy proposée et construite pour v3.0.0
-- **[@ojura](https://github.com/ojura)** — Analyse des causes profondes des résumés de réflexion Opus 4.7
+- **[@ojura](https://github.com/ojura)** — Analyse des causes profondes des résumés du Thinking d’Opus 4.7
 - **[@schuay](https://github.com/schuay)** — Améliorations de `quota-statusline.sh`
-- **[@codeslake](https://github.com/codeslake)** — Mode proxy forward optionnel, respect de `CLAUDE_CONFIG_DIR`
+- **[@codeslake](https://github.com/codeslake)** — Mode forward proxy optionnel, respect de `CLAUDE_CONFIG_DIR`
 - **[@Gunther-Schulz](https://github.com/Gunther-Schulz)** — Série d'attribution : capture, prefix-diff, normalisation d'insertion, réécriture d'outils différés, garde de sortie
 - **[@thepiper18](https://github.com/thepiper18)** — Traduction originale en portugais brésilien
 
