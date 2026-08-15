@@ -230,99 +230,75 @@ sudo loginctl enable-linger $USER   # optional: start on boot, not just on login
 Sur macOS :
 
 ```bash
-# Replace <session-uuid>, or use a glob to pick your most recent session.
-jq -r 'select(.message.usage.cache_read_input_tokens != null) |
-  "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
-  ~/.claude/projects/*/<session-uuid>.jsonl |
-  sort -u -k1,1 | cut -f2 |
-  awk '{n++; r+=$1; c+=$2}
-       END {if (n==0) print "no usage rows found — check the session path";
-            else printf "requests=%d cache_read=%d creation=%d read-ratio=%.0f%%\n", n, r, c, 100*r/(r+c)}'
-```0
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist
+launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+```
 
 **Manuel (toute plateforme) :**
 
 ```bash
-# Replace <session-uuid>, or use a glob to pick your most recent session.
-jq -r 'select(.message.usage.cache_read_input_tokens != null) |
-  "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
-  ~/.claude/projects/*/<session-uuid>.jsonl |
-  sort -u -k1,1 | cut -f2 |
-  awk '{n++; r+=$1; c+=$2}
-       END {if (n==0) print "no usage rows found — check the session path";
-            else printf "requests=%d cache_read=%d creation=%d read-ratio=%.0f%%\n", n, r, c, 100*r/(r+c)}'
-```1
+nohup cache-fix-proxy server > /tmp/cache-fix-proxy.log 2>&1 &
+echo 'export ANTHROPIC_BASE_URL=http://127.0.0.1:9801' >> ~/.bashrc
+```
 
 ### Docker
 
 Une image conteneur multi-arch (amd64, arm64) est publiée sur GitHub Container Registry à chaque tag de version.
 
 ```bash
-# Replace <session-uuid>, or use a glob to pick your most recent session.
-jq -r 'select(.message.usage.cache_read_input_tokens != null) |
-  "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
-  ~/.claude/projects/*/<session-uuid>.jsonl |
-  sort -u -k1,1 | cut -f2 |
-  awk '{n++; r+=$1; c+=$2}
-       END {if (n==0) print "no usage rows found — check the session path";
-            else printf "requests=%d cache_read=%d creation=%d read-ratio=%.0f%%\n", n, r, c, 100*r/(r+c)}'
-```2
+docker run -d --name cache-fix-proxy \
+  --restart=always \
+  -p 9801:9801 \
+  ghcr.io/cnighswonger/claude-code-cache-fix:latest
+
+# Puis dans votre shell :
+export ANTHROPIC_BASE_URL=http://127.0.0.1:9801
+```
 
 Utilisez `--restart=always` au lieu du compagnon de vérification de santé systemd — Docker gère l'auto-récupération nativement.
 
 Pour les environnements d'entreprise derrière un proxy inspectant SSL, montez votre bundle CA :
 
 ```bash
-# Replace <session-uuid>, or use a glob to pick your most recent session.
-jq -r 'select(.message.usage.cache_read_input_tokens != null) |
-  "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
-  ~/.claude/projects/*/<session-uuid>.jsonl |
-  sort -u -k1,1 | cut -f2 |
-  awk '{n++; r+=$1; c+=$2}
-       END {if (n==0) print "no usage rows found — check the session path";
-            else printf "requests=%d cache_read=%d creation=%d read-ratio=%.0f%%\n", n, r, c, 100*r/(r+c)}'
-```3
+docker run -d --name cache-fix-proxy --restart=always -p 9801:9801 \
+  -e HTTPS_PROXY=http://proxy.corp.example:8080 \
+  -e CACHE_FIX_PROXY_CA_FILE=/etc/ssl/corp-ca.pem \
+  -v /path/to/zscaler-root.pem:/etc/ssl/corp-ca.pem:ro \
+  ghcr.io/cnighswonger/claude-code-cache-fix:latest
+```
 
 Tags d'image : `latest`, `4`, `4.0`, `4.0.0`.
 
 **Note Linux :** l'exemple `host.docker.internal` chaîné ci-dessous est automatique sur Docker Desktop (macOS/Windows). Sur Docker Engine Linux nu vous avez généralement besoin de `--add-host=host.docker.internal:host-gateway` :
 
 ```bash
-# Replace <session-uuid>, or use a glob to pick your most recent session.
-jq -r 'select(.message.usage.cache_read_input_tokens != null) |
-  "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
-  ~/.claude/projects/*/<session-uuid>.jsonl |
-  sort -u -k1,1 | cut -f2 |
-  awk '{n++; r+=$1; c+=$2}
-       END {if (n==0) print "no usage rows found — check the session path";
-            else printf "requests=%d cache_read=%d creation=%d read-ratio=%.0f%%\n", n, r, c, 100*r/(r+c)}'
-```4
+docker run -d --name cache-fix-proxy --restart=always -p 9801:9801 \
+  --add-host=host.docker.internal:host-gateway \
+  -e CACHE_FIX_PROXY_UPSTREAM=http://host.docker.internal:8080 \
+  ghcr.io/cnighswonger/claude-code-cache-fix:latest
+```
 
 **Mode forward proxy dans Docker** (garde Remote Control). Ajoutez `-e CACHE_FIX_FORWARD_PROXY=on` et pointez `CACHE_FIX_CA_DIR` vers un chemin inscriptible :
 
 ```bash
-# Replace <session-uuid>, or use a glob to pick your most recent session.
-jq -r 'select(.message.usage.cache_read_input_tokens != null) |
-  "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
-  ~/.claude/projects/*/<session-uuid>.jsonl |
-  sort -u -k1,1 | cut -f2 |
-  awk '{n++; r+=$1; c+=$2}
-       END {if (n==0) print "no usage rows found — check the session path";
-            else printf "requests=%d cache_read=%d creation=%d read-ratio=%.0f%%\n", n, r, c, 100*r/(r+c)}'
-```5
+mkdir -p ./cache-fix-ca && sudo chown 1000:1000 ./cache-fix-ca
+docker run -d --name cache-fix-proxy --restart=always -p 9801:9801 \
+  -e CACHE_FIX_FORWARD_PROXY=on \
+  -e CACHE_FIX_CA_DIR=/ca -v "$PWD/cache-fix-ca:/ca" \
+  ghcr.io/cnighswonger/claude-code-cache-fix:latest
+
+# La CA est maintenant à ./cache-fix-ca/ca.pem sur l'hôte. Pointez le client vers le
+# proxy (laissez ANTHROPIC_BASE_URL non défini pour garder Remote Control actif) :
+HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS=$PWD/cache-fix-ca/ca.pem claude
+```
 
 ### Vérification de santé
 
 ```bash
-# Replace <session-uuid>, or use a glob to pick your most recent session.
-jq -r 'select(.message.usage.cache_read_input_tokens != null) |
-  "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
-  ~/.claude/projects/*/<session-uuid>.jsonl |
-  sort -u -k1,1 | cut -f2 |
-  awk '{n++; r+=$1; c+=$2}
-       END {if (n==0) print "no usage rows found — check the session path";
-            else printf "requests=%d cache_read=%d creation=%d read-ratio=%.0f%%\n", n, r, c, 100*r/(r+c)}'
-```6
+curl http://127.0.0.1:9801/health
+# {"status":"ok"}
+```
 
 ### Configuration du proxy
 
@@ -355,31 +331,31 @@ Le proxy respecte les variables suivantes lors du forwarding vers `api.anthropic
 
 Exemple (Windows PowerShell) :
 
-```bash
-# Replace <session-uuid>, or use a glob to pick your most recent session.
-jq -r 'select(.message.usage.cache_read_input_tokens != null) |
-  "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
-  ~/.claude/projects/*/<session-uuid>.jsonl |
-  sort -u -k1,1 | cut -f2 |
-  awk '{n++; r+=$1; c+=$2}
-       END {if (n==0) print "no usage rows found — check the session path";
-            else printf "requests=%d cache_read=%d creation=%d read-ratio=%.0f%%\n", n, r, c, 100*r/(r+c)}'
-```7
+```powershell
+$env:HTTPS_PROXY = 'http://proxy.corp.example:8080'
+$env:NO_PROXY    = 'localhost,127.0.0.1,.corp.example'
+$env:CACHE_FIX_PROXY_CA_FILE = 'C:\corp\zscaler-root.pem'
+node "$(npm root -g)\claude-code-cache-fix\proxy\server.mjs"
+```
 
 ### Intégration du proxy dans votre propre processus
 
 Si vous livrez un binaire Node ou Bun qui veut le proxy cache-fix in-process, importez la factory depuis `claude-code-cache-fix/proxy/server` :
 
-```bash
-# Replace <session-uuid>, or use a glob to pick your most recent session.
-jq -r 'select(.message.usage.cache_read_input_tokens != null) |
-  "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
-  ~/.claude/projects/*/<session-uuid>.jsonl |
-  sort -u -k1,1 | cut -f2 |
-  awk '{n++; r+=$1; c+=$2}
-       END {if (n==0) print "no usage rows found — check the session path";
-            else printf "requests=%d cache_read=%d creation=%d read-ratio=%.0f%%\n", n, r, c, 100*r/(r+c)}'
-```8
+```js
+import { startProxy } from "claude-code-cache-fix/proxy/server";
+
+const handle = await startProxy({
+  port: 0,        // port éphémère assigné par l'OS ; passez un nombre pour l'épingler
+  bind: "127.0.0.1",
+  watch: false,   // saute fs.watch — recommandé pour binaires compilés
+});
+
+console.log(`proxy en écoute sur ${handle.address}:${handle.port}`);
+
+// ...plus tard...
+await handle.close();
+```
 
 **`createProxyServer()` → `http.Server`** construit le handler de requête câblé dans un `http.Server`. Le serveur retourné n'écoute pas et le pipeline d'extensions n'a pas été chargé.
 
@@ -405,56 +381,35 @@ Votre unité systemd existante / plist launchd est inchangée ; seul le code pro
 **Linux (systemd user unit) :**
 
 ```bash
-# Replace <session-uuid>, or use a glob to pick your most recent session.
-jq -r 'select(.message.usage.cache_read_input_tokens != null) |
-  "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
-  ~/.claude/projects/*/<session-uuid>.jsonl |
-  sort -u -k1,1 | cut -f2 |
-  awk '{n++; r+=$1; c+=$2}
-       END {if (n==0) print "no usage rows found — check the session path";
-            else printf "requests=%d cache_read=%d creation=%d read-ratio=%.0f%%\n", n, r, c, 100*r/(r+c)}'
-```9
+npm install -g claude-code-cache-fix@4
+systemctl --user restart cache-fix-proxy
+```
 
 **macOS (launchd user agent) :**
 
 ```bash
-# Install
-npm install -g claude-code-cache-fix
-
-# Start the proxy (runs on localhost:9801)
-node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-
-# Launch Claude Code through it
-ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
-```0
+npm install -g claude-code-cache-fix@4
+launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+```
 
 ### Flux 2 — réactivation du hot-reload au niveau superviseur
 
 **Linux :**
 
 ```bash
-# Install
-npm install -g claude-code-cache-fix
-
-# Start the proxy (runs on localhost:9801)
-node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-
-# Launch Claude Code through it
-ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
-```1
+CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
+systemctl --user daemon-reload
+systemctl --user restart cache-fix-proxy
+```
 
 **macOS :**
 
 ```bash
-# Install
-npm install -g claude-code-cache-fix
-
-# Start the proxy (runs on localhost:9801)
-node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-
-# Launch Claude Code through it
-ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
-```2
+CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
+launchctl bootout gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist
+launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+```
 
 ## Ce que ce proxy défend contre
 
@@ -492,16 +447,15 @@ Le proxy corrige ce qu'il peut au niveau requête. Quelques vars d'environnement
 
 ### Bloc env suggéré pour `~/.claude/settings.json`
 
-```bash
-# Install
-npm install -g claude-code-cache-fix
-
-# Start the proxy (runs on localhost:9801)
-node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-
-# Launch Claude Code through it
-ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
-```3
+```json
+{
+  "env": {
+    "CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP": "1",
+    "ANTHROPIC_MODEL": "claude-opus-4-7",
+    "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-4-5-20251001"
+  }
+}
+```
 
 **`CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP=1`** — flag le plus impactant. CC a un chemin legacy qui remap silencieusement votre modèle épinglé vers un autre après certaines mises à jour. Mettre à `1` désactive le remap.
 
@@ -528,15 +482,9 @@ Exécuter `/context`, `/release-notes` ajoute la sortie diagnostic à l'historiq
 Si vous êtes sur une version CC basée Node.js (v2.1.112 ou antérieure), l'intercepteur preload fonctionne sans proxy :
 
 ```bash
-# Install
 npm install -g claude-code-cache-fix
-
-# Start the proxy (runs on localhost:9801)
-node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-
-# Launch Claude Code through it
-ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
-```4
+NODE_OPTIONS="--import claude-code-cache-fix" claude
+```
 
 Voir [docs/preload-setup.md](docs/preload-setup.md) pour les scripts wrapper, alias shell, instructions Windows et intégration VS Code mode preload.
 
@@ -591,31 +539,18 @@ Le paquet sert trois objectifs avec des cycles de vie différents :
 
 Au premier appel API, l'intercepteur journalise une ligne d'état de santé (nécessite `CACHE_FIX_DEBUG=1`) :
 
-```bash
-# Install
-npm install -g claude-code-cache-fix
-
-# Start the proxy (runs on localhost:9801)
-node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-
-# Launch Claude Code through it
-ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
-```5
+```
+cache-fix health: relocate=active(2h ago) fingerprint=dormant(5 clean sessions) tool_sort=active ttl=active identity=waiting
+```
 
 ### Détection de régression
 
 Si le ratio cache_read tombe sous 50% sur 5+ appels après désactivation des corrections :
 
-```bash
-# Install
-npm install -g claude-code-cache-fix
-
-# Start the proxy (runs on localhost:9801)
-node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-
-# Launch Claude Code through it
-ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
-```6
+```
+REGRESSION WARNING: cache_read ratio averaged 12% across last 5 calls.
+Fixes are disabled — consider re-enabling to recover cache performance.
+```
 
 ## Sécurité
 
@@ -641,42 +576,28 @@ Les deux modes écrivent l'état du quota à chaque appel API. Le mode proxy (v3
 
 Exemple de ligne (milieu de fenêtre, état sain) :
 
-```bash
-# Install
-npm install -g claude-code-cache-fix
-
-# Start the proxy (runs on localhost:9801)
-node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-
-# Launch Claude Code through it
-ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
-```7
+```
+Q5h [███░┃░░░░░] 30% (exhaust 4h40m, reset 3h00m) | Q7d [█████┃░░░░] 53% (exhaust 3d13h, reset 3d0h) | TTL:1h 98.3%
+```
 
 ### Installation
 
 ```bash
-# Install
-npm install -g claude-code-cache-fix
-
-# Start the proxy (runs on localhost:9801)
-node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-
-# Launch Claude Code through it
-ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
-```8
+mkdir -p ~/.claude/hooks
+cp "$(npm root -g)/claude-code-cache-fix/tools/quota-statusline.sh" ~/.claude/hooks/
+chmod +x ~/.claude/hooks/quota-statusline.sh
+```
 
 Ajoutez à `~/.claude/settings.json` :
 
-```bash
-# Install
-npm install -g claude-code-cache-fix
-
-# Start the proxy (runs on localhost:9801)
-node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-
-# Launch Claude Code through it
-ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
-```9
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/hooks/quota-statusline.sh"
+  }
+}
+```
 
 ### Pourquoi la ligne de statut est importante
 
@@ -687,17 +608,8 @@ Quand le serveur rétrograde votre TTL à 5m (rétrogradation quota-aware à Q5h
 Claude Code injecte le `git status` live dans le prompt système à chaque appel. Toute édition de fichier change le git status, ce qui bust tout le cache préfixe. Désactiver ceci économise ~1 800 tokens par appel :
 
 ```bash
-# Start the proxy in forward-proxy mode
-CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-# It prints the two env vars to wire the client, e.g.:
-#   export HTTPS_PROXY=http://127.0.0.1:9801
-#   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
-
-# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
-HTTPS_PROXY=http://127.0.0.1:9801 \
-NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
-  claude
-```0
+export CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1
+```
 
 ## Migration : v3.4.x → v3.5.0+
 
@@ -722,32 +634,93 @@ Votre script doit essayer les chemins v3.5.0+ proxy d'abord et retomber sur le c
 **Bash (style statusline) :**
 
 ```bash
-# Start the proxy in forward-proxy mode
-CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-# It prints the two env vars to wire the client, e.g.:
-#   export HTTPS_PROXY=http://127.0.0.1:9801
-#   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
+QS_DIR="$HOME/.claude/quota-status"
+ACCOUNT="$QS_DIR/account.json"
+LEGACY="$HOME/.claude/quota-status.json"
 
-# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
-HTTPS_PROXY=http://127.0.0.1:9801 \
-NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
-  claude
-```1
+# Règle de nom de fichier canonique — doit refléter proxy/extensions/cache-telemetry.mjs
+# sessionFilename() : trim, puis "" → unknown, passe-plat regex sûr, sinon
+# inv-<sha256-prefix>. Sans ceci, les ids malformés ou avec whitespace ratent
+# le fichier per-session même si l'écrivain l'a créé sous le nom canonique.
+session_filename() {
+  local trimmed
+  trimmed="$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [ -z "$trimmed" ]; then echo unknown; return; fi
+  if printf '%s' "$trimmed" | grep -qE '^[A-Za-z0-9_-]{1,128}$'; then
+    printf '%s' "$trimmed"
+  else
+    # sha256sum sur Linux ; shasum -a 256 sur macOS. Les deux émettent "<hex>  -".
+    local hash
+    if command -v sha256sum >/dev/null 2>&1; then
+      hash="$(printf '%s' "$trimmed" | sha256sum)"
+    else
+      hash="$(printf '%s' "$trimmed" | shasum -a 256)"
+    fi
+    printf 'inv-%s' "$(printf '%s' "$hash" | cut -c1-16)"
+  fi
+}
+
+# session id : préfère stdin CC, retombe sur le jsonl le plus récent
+sid="$(jq -r '.session_id // empty' 2>/dev/null < /dev/stdin || true)"
+if [ -z "$sid" ]; then
+  sid="$(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -1 | xargs -I{} basename {} .jsonl)"
+fi
+filename="$(session_filename "$sid")"
+
+# quota : account.json (v3.5.0+) → retombe sur legacy
+if [ -f "$ACCOUNT" ]; then
+  quota_json="$(cat "$ACCOUNT")"
+elif [ -f "$LEGACY" ]; then
+  quota_json="$(cat "$LEGACY")"
+fi
+
+# cache : sessions/<filename>.json (v3.5.0+) → retombe sur legacy
+if [ -f "$QS_DIR/sessions/$filename.json" ]; then
+  cache_json="$(cat "$QS_DIR/sessions/$filename.json")"
+elif [ -f "$LEGACY" ]; then
+  cache_json="$(cat "$LEGACY")"
+fi
+```
 
 **Node :**
 
-```bash
-# Start the proxy in forward-proxy mode
-CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-# It prints the two env vars to wire the client, e.g.:
-#   export HTTPS_PROXY=http://127.0.0.1:9801
-#   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
+```js
+import { readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { createHash } from "node:crypto";
 
-# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
-HTTPS_PROXY=http://127.0.0.1:9801 \
-NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
-  claude
-```2
+const home = homedir();
+const accountPath = join(home, ".claude", "quota-status", "account.json");
+const legacyPath = join(home, ".claude", "quota-status.json");
+
+const SAFE_NAME_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+// Miroir de sessionFilename() de cache-telemetry.mjs. La règle côté lecteur doit
+// correspondre à la règle côté écrivain ; sinon les ids malformés/avec whitespace
+// ratent leur fichier per-session.
+function sessionFilename(rawId) {
+  if (rawId === null || rawId === undefined) return "unknown";
+  const s = String(rawId).trim();
+  if (s.length === 0) return "unknown";
+  if (SAFE_NAME_RE.test(s)) return s;
+  return "inv-" + createHash("sha256").update(s).digest("hex").slice(0, 16);
+}
+
+function readQuotaJson() {
+  if (existsSync(accountPath)) return JSON.parse(readFileSync(accountPath, "utf8"));
+  if (existsSync(legacyPath)) return JSON.parse(readFileSync(legacyPath, "utf8"));
+  return null;
+}
+
+function readCacheJson(sessionId) {
+  const filename = sessionFilename(sessionId);
+  const p = join(home, ".claude", "quota-status", "sessions", `${filename}.json`);
+  if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8"));
+  if (existsSync(legacyPath)) return JSON.parse(readFileSync(legacyPath, "utf8"));
+  return null;
+}
+```
 
 ### Pourquoi par session
 
@@ -762,32 +735,14 @@ Claude Code lit `CLAUDE_CONFIG_DIR` pour relocaliser sa racine config loin du d�
 Les images lues via l'outil Read persistent en base64 dans l'historique de conversation. Une seule image 500 Ko coûte ~62 500 tokens par tour sur Opus 4.6, et **~85 000+ sur Opus 4.7**.
 
 ```bash
-# Start the proxy in forward-proxy mode
-CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-# It prints the two env vars to wire the client, e.g.:
-#   export HTTPS_PROXY=http://127.0.0.1:9801
-#   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
-
-# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
-HTTPS_PROXY=http://127.0.0.1:9801 \
-NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
-  claude
-```3
+export CACHE_FIX_IMAGE_KEEP_LAST=3
+```
 
 ### Garde d'images surdimensionnées (legacy, v3.2.1)
 
 ```bash
-# Start the proxy in forward-proxy mode
-CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-# It prints the two env vars to wire the client, e.g.:
-#   export HTTPS_PROXY=http://127.0.0.1:9801
-#   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
-
-# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
-HTTPS_PROXY=http://127.0.0.1:9801 \
-NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
-  claude
-```4
+export CACHE_FIX_IMAGE_MAX_DIM=2000
+```
 
 | Pression | Variable | Ce qu'elle fait |
 |---|---|---|
@@ -799,17 +754,8 @@ NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
 Pipeline conditionnel qui reflète les vraies règles d'Anthropic. Strictement opt-in via une seule env var :
 
 ```bash
-# Start the proxy in forward-proxy mode
-CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-# It prints the two env vars to wire the client, e.g.:
-#   export HTTPS_PROXY=http://127.0.0.1:9801
-#   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
-
-# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
-HTTPS_PROXY=http://127.0.0.1:9801 \
-NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
-  claude
-```5
+export CACHE_FIX_IMAGE_GUARD=1
+```
 
 | Pass | Déclencheur | Action |
 |------|---------|--------|
@@ -824,17 +770,8 @@ NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
 Le Pass 3 nécessite [sharp](https://www.npmjs.com/package/sharp) pour resize Lanczos.
 
 ```bash
-# Start the proxy in forward-proxy mode
-CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-# It prints the two env vars to wire the client, e.g.:
-#   export HTTPS_PROXY=http://127.0.0.1:9801
-#   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
-
-# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
-HTTPS_PROXY=http://127.0.0.1:9801 \
-NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
-  claude
-```6
+npm install sharp
+```
 
 #### Matrice de précédence
 
@@ -868,17 +805,8 @@ Le disjoncteur surveille chaque réponse route messages. Quand upstream retourne
 Opt-in via env var ; default-off :
 
 ```bash
-# Start the proxy in forward-proxy mode
-CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-# It prints the two env vars to wire the client, e.g.:
-#   export HTTPS_PROXY=http://127.0.0.1:9801
-#   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
-
-# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
-HTTPS_PROXY=http://127.0.0.1:9801 \
-NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
-  claude
-```7
+export CACHE_FIX_IMAGE_RETRY_BREAKER=on
+```
 
 | Mode | Comportement |
 |------|----------|
@@ -893,17 +821,9 @@ Un **plafond de dépenses dur par session** opt-in. Une fois que la consommation
 Opt-in via la gate ; **default-off** :
 
 ```bash
-# Start the proxy in forward-proxy mode
-CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-# It prints the two env vars to wire the client, e.g.:
-#   export HTTPS_PROXY=http://127.0.0.1:9801
-#   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
-
-# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
-HTTPS_PROXY=http://127.0.0.1:9801 \
-NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
-  claude
-```8
+export CACHE_FIX_SESSION_BUDGET=on
+export CACHE_FIX_SESSION_BUDGET_COST_USD=25      # p.ex. stop la session à ~$25
+```
 
 | Mode | Comportement |
 |------|----------|
@@ -954,17 +874,10 @@ L'existant `fingerprint-strip` ne couvre PAS ce cas.
 Opt-in via env var ; default-off :
 
 ```bash
-# Start the proxy in forward-proxy mode
-CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
-# It prints the two env vars to wire the client, e.g.:
-#   export HTTPS_PROXY=http://127.0.0.1:9801
-#   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
-
-# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
-HTTPS_PROXY=http://127.0.0.1:9801 \
-NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
-  claude
-```9
+export CACHE_FIX_NORMALIZE_CC_VERSION=strip          # collapse X.Y.Z.<suffix> → X.Y.Z
+# ou
+export CACHE_FIX_NORMALIZE_CC_VERSION=pin:2.1.185    # littéral fourni par l'opérateur
+```
 
 ## Sauvegarde de session (mode proxy, opt-in)
 
@@ -976,7 +889,7 @@ Opt-in via env var ; default-off :
 # Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
 # (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
 cache-fix-proxy --remote-control
-```0
+```
 
 ## Points d'arrêt de cache (mode proxy, opt-in)
 
@@ -988,7 +901,7 @@ Le proxy peut injecter le marqueur manquant en opt-in.
 # Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
 # (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
 cache-fix-proxy --remote-control
-```1
+```
 
 L'injection est conservatrice : elle ne tire que quand la requête porte déjà 1–3 marqueurs.
 
@@ -998,7 +911,7 @@ Une env var diagnostic-only dump la forme structurelle de `messages[0]` :
 # Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
 # (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
 cache-fix-proxy --remote-control
-```2
+```
 
 ## Stabilité microcompact (mode proxy, opt-in)
 
@@ -1010,7 +923,7 @@ Cette extension adresse la moitié récupérable : normaliser la sentinelle vers
 # Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
 # (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
 cache-fix-proxy --remote-control
-```3
+```
 
 ## Résumés du Thinking (mode proxy, optionnel, Opus 4.7+)
 
@@ -1020,7 +933,7 @@ Sur Opus 4.7, Anthropic a inversé la valeur par défaut API pour `thinking.disp
 # Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
 # (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
 cache-fix-proxy --remote-control
-```4
+```
 
 L'extension est **activée par défaut** depuis v3.6.1. Le test cache-prefix a mesuré 0% de baisse absolue du ratio `cache_read` en état stable quand l'injection est active sur Opus 4.7.
 
@@ -1074,7 +987,7 @@ L'extension `usage-log` (opt-in via `proxy/extensions.json`) ajoute une ligne JS
 # Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
 # (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
 cache-fix-proxy --remote-control
-```5
+```
 
 ### Extension `upstream-error-log` (capture des réponses non-200)
 
@@ -1088,7 +1001,7 @@ Opt-in via env var ; default-off :
 # Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
 # (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
 cache-fix-proxy --remote-control
-```6
+```
 
 ### Rafraîchissement OAuth appartenant au proxy (opt-in)
 
@@ -1100,7 +1013,7 @@ Opt-in via env var ; default-off :
 # Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
 # (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
 cache-fix-proxy --remote-control
-```7
+```
 
 | Env var | Défaut | But |
 |---------|---------|---------|
