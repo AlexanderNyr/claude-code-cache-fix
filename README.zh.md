@@ -2,7 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/claude-code-cache-fix?color=blue)](https://www.npmjs.com/package/claude-code-cache-fix) [![Node.js](https://img.shields.io/badge/Node.js-18%2B-green)](https://nodejs.org/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](https://opensource.org/licenses/MIT) [![GitHub stars](https://img.shields.io/github/stars/cnighswonger/claude-code-cache-fix)](https://github.com/cnighswonger/claude-code-cache-fix/stargazers)
 
-[English](./README.md) | 中文 | [한국어](./README.ko.md) | [Português](./docs/guia-pt-br.md)
+[English](./README.md) | 中文 | [한국어](./README.ko.md) | [Français](./README.fr.md) | [Português](./docs/guia-pt-br.md)
 
 > **说明：** 本翻译由机器辅助生成，可能滞后于英文版 README。任何权威信息请参见 [README.md](./README.md)。欢迎修正——请提交 PR。
 >
