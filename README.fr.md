@@ -886,9 +886,7 @@ Un backup ceinture-et-bretelles contre les régressions transcript CC par [anthr
 Opt-in via env var ; default-off :
 
 ```bash
-# Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
-# (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
-cache-fix-proxy --remote-control
+export CACHE_FIX_SESSION_MIRROR=on
 ```
 
 ## Points d'arrêt de cache (mode proxy, opt-in)
@@ -898,9 +896,7 @@ Le prompt cache d'Anthropic supporte jusqu'à **quatre** marqueurs `cache_contro
 Le proxy peut injecter le marqueur manquant en opt-in.
 
 ```bash
-# Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
-# (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
-cache-fix-proxy --remote-control
+export CACHE_FIX_INJECT_MESSAGES_BREAKPOINT=1
 ```
 
 L'injection est conservatrice : elle ne tire que quand la requête porte déjà 1–3 marqueurs.
@@ -908,9 +904,7 @@ L'injection est conservatrice : elle ne tire que quand la requête porte déjà 
 Une env var diagnostic-only dump la forme structurelle de `messages[0]` :
 
 ```bash
-# Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
-# (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
-cache-fix-proxy --remote-control
+export CACHE_FIX_DUMP_MESSAGES_HEAD=/tmp/messages-head.jsonl
 ```
 
 ## Stabilité microcompact (mode proxy, opt-in)
@@ -920,9 +914,11 @@ Après ~90 minutes idle, le `time_based_microcompact` de Claude Code remplace l'
 Cette extension adresse la moitié récupérable : normaliser la sentinelle vers une forme canonique stable.
 
 ```bash
-# Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
-# (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
-cache-fix-proxy --remote-control
+# Étape 1 (diagnostic) : dump les sentinelles détectées vers un JSONL pour observation.
+export CACHE_FIX_DUMP_MICROCOMPACT=/tmp/microcompact-dump.jsonl
+
+# Étape 2 (normalisation) : une fois le format de sentinelle confirmé, opt-in.
+export CACHE_FIX_NORMALIZE_MICROCOMPACT=1
 ```
 
 ## Résumés du Thinking (mode proxy, optionnel, Opus 4.7+)
@@ -930,9 +926,14 @@ cache-fix-proxy --remote-control
 Sur Opus 4.7, Anthropic a inversé la valeur par défaut API pour `thinking.display` de `"summarized"` à `"omitted"`. Cette extension est le complément côté proxy : quand une requête vers un endpoint Opus 4.7 a thinking activé mais `display` non défini, injecte le mode configuré à la frontière API.
 
 ```bash
-# Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
-# (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
-cache-fix-proxy --remote-control
+# Restaure les résumés (le défaut intégré — surfaces non-interactives obtiennent le contenu du raisonnement)
+export CACHE_FIX_THINKING_DISPLAY=summarized
+
+# Suppression forcée (runtimes d'agent qui ne veulent pas de blocs thinking du tout)
+export CACHE_FIX_THINKING_DISPLAY=omitted
+
+# No-op explicite (l'extension passe-through inchangée)
+export CACHE_FIX_THINKING_DISPLAY=disabled
 ```
 
 L'extension est **activée par défaut** depuis v3.6.1. Le test cache-prefix a mesuré 0% de baisse absolue du ratio `cache_read` en état stable quand l'injection est active sur Opus 4.7.
@@ -981,13 +982,18 @@ L'extension `usage-log` (opt-in via `proxy/extensions.json`) ajoute une ligne JS
 | `model` | string ≤64 | `message_start.message.model` |
 | `request_id` | string ≤64 (optionnel) | en-tête réponse upstream `request-id`. **Default-on depuis v4.2.0** |
 
-**Pourquoi `request_id` compte opérationnellement.**
+**Pourquoi `request_id` compte opérationnellement.** Le champ `sid` est généré une fois au démarrage du proxy et partagé entre chaque session CC servie par ce proxy. Sur les hôtes qui font tourner plusieurs sessions CC concurrentes via un seul proxy, toutes les lignes s'effondrent sur le même `sid`. Les transcripts CC par session à `~/.claude/projects/<project>/<session-uuid>.jsonl` portent déjà `requestId` pour chaque appel API. Capturer la même valeur dans la ligne meter rend la jointure post-hoc triviale :
 
 ```bash
-# Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
-# (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
-cache-fix-proxy --remote-control
+# Trouve à quelle session CC appartient chaque ligne usage.jsonl :
+for row in $(jq -c . < ~/.claude/usage.jsonl); do
+  req=$(jq -r '.request_id // empty' <<< "$row")
+  [ -z "$req" ] && continue
+  grep -l "\"requestId\":\"$req\"" ~/.claude/projects/*/*.jsonl
+done
 ```
+
+Le nom de fichier du transcript correspondant est l'UUID de la session CC, récupérant l'attribution par session pour chaque ligne meter émise avec le champ activé.
 
 ### Extension `upstream-error-log` (capture des réponses non-200)
 
@@ -998,9 +1004,7 @@ L'extension `usage-log` ci-dessus n'enregistre que les réponses réussies (200)
 Opt-in via env var ; default-off :
 
 ```bash
-# Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
-# (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
-cache-fix-proxy --remote-control
+export CACHE_FIX_UPSTREAM_ERROR_LOG=on
 ```
 
 ### Rafraîchissement OAuth appartenant au proxy (opt-in)
@@ -1010,9 +1014,7 @@ Sous-système default-off qui fait du proxy cache-fix le seul, proactif, lock-co
 Opt-in via env var ; default-off :
 
 ```bash
-# Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
-# (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
-cache-fix-proxy --remote-control
+export CACHE_FIX_OAUTH_REFRESH=on
 ```
 
 | Env var | Défaut | But |
