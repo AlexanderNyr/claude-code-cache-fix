@@ -25,7 +25,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomBytes, X509Certificate, createPublicKey } from "node:crypto";
 import config from "./config.mjs";
-import { getAgent } from "./upstream.mjs";
+import { getAgent, resolveHop, requireHop, defaultPort } from "./upstream.mjs";
 import { discoverBucket } from "./downloads-bucket.mjs";
 
 function upstreamHost() {
@@ -181,7 +181,26 @@ export function ensureCA() {
   const tmp = (n) => join(caDir, `.tmp.${process.pid}.${n}`);
   try {
     if (ready()) return publish();
-    const run = (args) => execFileSync("openssl", args, { stdio: ["ignore", "ignore", "pipe"] });
+    // BOUNDED, like every other shell-out onto a user's machine — and this was
+    // the last unbounded call in the tree, which made that invariant untrue
+    // while it was being stated. It is also the worst place to be missing one:
+    // this runs inside startProxy() BEFORE the proxy listens, and while holding
+    // the CA lock taken above, so a wedged openssl stalls every sibling waiting
+    // out config.caLockWaitMs too. SIGKILL because a stuck openssl is stuck.
+    //
+    // A FIXED CEILING, NO KNOB. An earlier cut reused CACHE_FIX_PROBE_TIMEOUT_MS
+    // and then added CACHE_FIX_OPENSSL_TIMEOUT_MS to escape it — but the second
+    // still fell back to the first, so an operator lowering the probe knob to
+    // bound a sick `lsof` went on capping CA minting, which is the coupling the
+    // new knob was added to remove. Measured, `openssl genrsa 2048` over 15
+    // runs: 19-88 ms. 10 s is a hundredfold headroom over the worst of those,
+    // so there is nothing here for an operator to tune.
+    const run = (args) => execFileSync("openssl", args, {
+      stdio: ["ignore", "ignore", "pipe"],
+      timeout: 10_000,
+      killSignal: "SIGKILL",
+      maxBuffer: 1 << 20,
+    });
 
     // Reuse an existing root CA; only mint a new one on first run. Regenerating
     // the root here is a bug: the client trusts the CA via a NODE_EXTRA_CA_CERTS
@@ -196,8 +215,29 @@ export function ensureCA() {
     const caPemSrc = haveCA ? caPem : tmp("ca.pem");
     const caKeySrc = haveCA ? caKey : tmp("ca.key");
     if (!haveCA) {
+      // keyUsage is not decoration. RFC 5280 4.2.1.3 says a CA certificate
+      // SHOULD carry keyUsage with keyCertSign, and verifiers have started
+      // enforcing that SHOULD: without it they refuse the chain with "CA cert
+      // does not include key usage extension" no matter which bundle names us.
+      //
+      // Measured through a live proxy with our own CA as the trust anchor, one
+      // row per python interpreter across three machines:
+      //   OpenSSL 3.0.2 / 3.6.1 / LibreSSL 2.8.3   verified
+      //   OpenSSL 3.5.5 / 3.5.7 / 3.6.3            refused
+      // Every machine had at least one refusing interpreter, and the SAME 3.5.5
+      // accepted on one host and refused on another — so this is not a platform
+      // or a version ladder, and there is no host we can call safe. The peer
+      // MITM on those same boxes ships keyUsage and verifies everywhere; that
+      // is the control that makes this ours rather than the verifier's.
+      //
+      // -addext, not an extfile: `req -x509` ignores extensions passed the way
+      // the leaf below passes them, and a silently-ignored extension is how this
+      // shipped unnoticed in the first place. The test asserts the extension is
+      // ON the minted certificate, not that the flag was passed.
       run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", tmp("ca.key"), "-out", tmp("ca.pem"),
-           "-days", "3650", "-subj", "/CN=cache-fix forward-proxy CA"]);
+           "-days", "3650", "-subj", "/CN=cache-fix forward-proxy CA",
+           "-addext", "basicConstraints=critical,CA:TRUE",
+           "-addext", "keyUsage=critical,keyCertSign,cRLSign"]);
     }
     run(["genrsa", "-out", tmp("leaf.key"), "2048"]);
     const csr = tmp("leaf.csr");
@@ -241,17 +281,56 @@ export function ensureCA() {
 // Parse an http(s)://host:port proxy URL into { host, port }.
 function parseProxy(url) {
   if (!url) return null;
-  try { const u = new URL(url); return { host: u.hostname, port: Number(u.port) || 80 }; }
+  // Scheme-defaulted, like hopAlive(): `|| 80` sent the CONNECT for an
+  // `https://hop` carrying no explicit port to :80, so the tunnel died against
+  // a hop hopAlive() had just confirmed on :443.
+  // AND THE SCHEME, not just the port it implies. Dropping it made an
+  // `https://hop` dialled in PLAINTEXT on :443 by both CONNECT sites below —
+  // the port was already right, which is exactly why this hid. The hop's TLS
+  // listener never answers an HTTP request line, so the tunnel hangs to its
+  // timeout, and hopAlive()'s TCP probe says the hop is fine the whole time, so
+  // the chain keeps picking it instead of falling through to the next one.
+  //
+  // forwardRequest's path had none of this: buildAgent hands proxyUrl to
+  // HttpsProxyAgent, which reads the scheme itself. So one chain was dialled
+  // correctly by one caller and in the clear by two others.
+  try { const u = new URL(url); return { host: u.hostname, secure: u.protocol === "https:",
+                                         port: defaultPort(u) }; }
   catch { return null; }
 }
 
+// The outbound hop for a CONNECT: the configured upstream when it answers, else
+// the first reachable fallback, else "" for a direct dial.
+//
+// resolveHop() and NOT config.httpsProxy. That getter reads
+// CACHE_FIX_UPSTREAM_PROXY / HTTPS_PROXY and is never fed by
+// CACHE_FIX_FALLBACK_PROXIES, so with only a fallback configured — the shipped
+// wiring — it is "" and every CONNECT dialled direct. On the work Mac that
+// meant straight into the corporate MITM: `/login` failed with
+// UNABLE_TO_GET_ISSUER_CERT while plain HTTP failed over correctly, because
+// forwardRequest() was resolveHop()'s only caller. Found by cswap's pin.
+//
+// Async where the old read was synchronous, so both callers moved their dial
+// into a continuation. That is the whole cost: hopAlive() is a refused-or-
+// accepted connect, one syscall, and a hop that is down refuses rather than
+// hanging.
+const hopFor = async () => parseProxy(await resolveHop(true));
+
 // Blind-tunnel a CONNECT to `target` (host:port) untouched. Routes through the
-// outbound proxy (config.httpsProxy, e.g. a corporate proxy) when set, else
-// dials the target directly. No TLS termination; bytes pass through opaque.
-function blindTunnel(target, clientSocket, head) {
+// resolved hop when there is one, else dials the target directly. No TLS
+// termination; bytes pass through opaque.
+async function blindTunnel(target, clientSocket, head) {
   const [host, portStr] = target.split(":");
   const port = Number(portStr) || 443;
-  const via = parseProxy(config.httpsProxy);
+  const via = await hopFor();
+  // The client may have given up while we probed the chain; dialling for a
+  // dead socket leaks the upstream connection.
+  if (clientSocket.destroyed) return;
+  if (!via && requireHop()) {
+    process.stderr.write(`[forward-proxy] no chain hop reachable and CACHE_FIX_REQUIRE_HOP=1 — refusing ${target}\n`);
+    clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+    return;
+  }
   const onUpstream = (upstream) => {
     clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
     if (head && head.length) upstream.write(head);
@@ -263,8 +342,12 @@ function blindTunnel(target, clientSocket, head) {
   };
   if (via) {
     // CONNECT target through the outbound proxy.
-    const r = http.request({ host: via.host, port: via.port, method: "CONNECT", path: target,
-                             headers: { host: target } });
+    // TLS TO THE HOP WHEN THE HOP IS https:// — see parseProxy(). servername is
+    // the hop's own name, not the target's: this handshake is with the proxy.
+    const r = (via.secure ? https : http).request({
+      host: via.host, port: via.port, method: "CONNECT", path: target,
+      headers: { host: target },
+      ...(via.secure ? { servername: via.host, rejectUnauthorized: config.rejectUnauthorized } : {}) });
     r.on("connect", (res, socket) => {
       // Node fires 'connect' even when the outbound proxy DENIES the tunnel
       // (403/407/502). Relaying our own "200 Connection Established" then would
@@ -291,17 +374,25 @@ function blindTunnel(target, clientSocket, head) {
 // Open a TLS connection to the upstream host, directly or through the corp
 // CONNECT proxy (config.httpsProxy), and invoke cb(tlsSocket). Used to relay a
 // MITM'd WebSocket upgrade to the real upstream.
-function connectUpstreamTLS(cb, onErr) {
+async function connectUpstreamTLS(cb, onErr) {
   let upHost = "api.anthropic.com", upPort = 443;
   try { const u = new URL(config.upstream); upHost = u.hostname; upPort = Number(u.port) || 443; } catch {}
   const finish = (rawSocket) => {
     const tlsUp = tls.connect({ socket: rawSocket, servername: upHost }, () => cb(tlsUp));
     tlsUp.on("error", onErr);
   };
-  const via = parseProxy(config.httpsProxy);
+  // Same chain as the blind tunnel above — see hopFor().
+  let via;
+  try { via = await hopFor(); } catch (err) { return onErr(err); }
+  if (!via && requireHop()) return onErr(new Error("no chain hop reachable (CACHE_FIX_REQUIRE_HOP=1)"));
   if (via) {
-    const r = http.request({ host: via.host, port: via.port, method: "CONNECT",
-                             path: `${upHost}:${upPort}`, headers: { host: `${upHost}:${upPort}` } });
+    // Same as blindTunnel above: the transport to the HOP follows the hop's own
+    // scheme. The tls.connect in finish() is a second, independent handshake —
+    // that one is with the upstream host, through whatever this returns.
+    const r = (via.secure ? https : http).request({
+      host: via.host, port: via.port, method: "CONNECT",
+      path: `${upHost}:${upPort}`, headers: { host: `${upHost}:${upPort}` },
+      ...(via.secure ? { servername: via.host, rejectUnauthorized: config.rejectUnauthorized } : {}) });
     r.on("connect", (res, rawSocket) => {
       if (res.statusCode !== 200) { rawSocket.destroy(); onErr(new Error(`upstream CONNECT ${res.statusCode}`)); return; }
       finish(rawSocket);
@@ -331,7 +422,7 @@ function relayUpstreamUpgrade(req, clientSocket, head) {
     clientSocket.pipe(up);
     up.on("error", () => bail(up));
     clientSocket.on("error", () => bail(up));
-  }, () => bail(null));
+  }, () => bail(null)).catch(() => bail(null));   // async since it resolves the hop
 }
 
 // Egress agent for the storage re-issue: reuse the corp CONNECT proxy
@@ -574,7 +665,13 @@ export function attachForwardProxy(server) {
         return;
       }
 
-      if (reqHost !== host) return blindTunnel(target, clientSocket, head);
+      // blindTunnel resolves the hop, so it is async now. An unhandled
+      // rejection here would be swallowed by forward mode's own self-heal and
+      // leave the client socket open forever; destroy it instead.
+      if (reqHost !== host) {
+        blindTunnel(target, clientSocket, head).catch(() => clientSocket.destroy());
+        return;
+      }
 
       // MITM the upstream host: terminate TLS with our leaf, then hand the
       // decrypted socket to the server's HTTP handler as if it were a plaintext

@@ -1,9 +1,10 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { withDeadline, exitWithin } from "./child-deadline.mjs";
 import { fork, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, availableParallelism } from "node:os";
 import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import tls from "node:tls";
@@ -70,7 +71,7 @@ describe("proxy server lifecycle", () => {
     assert.equal(res.statusCode, 200);
 
     proxyProc.kill("SIGTERM");
-    await new Promise((resolve) => proxyProc.on("exit", resolve));
+    await exitWithin(proxyProc, 30_000, "the proxy never exited after SIGTERM");
   });
 
   it("shuts down cleanly on SIGTERM", async () => {
@@ -87,7 +88,16 @@ describe("proxy server lifecycle", () => {
     });
 
     proxyProc.kill("SIGTERM");
-    const code = await new Promise((resolve) => proxyProc.on("exit", (c) => resolve(c)));
+    // Bounded, because `node --test` defaults to NO test timeout at all: a
+    // child that does not honour SIGTERM makes this await block forever, the
+    // case never fails, and the CI job idles to GitHub's 360-minute default —
+    // observed on run 31018228595, where node 22 finished in 39 s while 18 and
+    // 20 sat `in_progress` past 80 minutes with nothing reported as failed.
+    // 30 s is 6x the proxy's own 5 s shutdown grace, so a slow-but-honest drain
+    // still passes; only a child that is never going to exit trips it.
+    const code = await withDeadline(
+      new Promise((resolve) => proxyProc.on("exit", (c) => resolve(c))),
+      30_000, proxyProc, "the proxy never exited after SIGTERM");
     assert.equal(code, 0);
   });
 });
@@ -103,8 +113,21 @@ function cleanEnv(overrides) {
   // direction: it is a seam ONE test sets, and a leak would make every later
   // test's CA probe answer "could not ask" — silently turning the assertions
   // that follow into measurements of the fallback rather than of the guard.
+  // The TRUST vars are here for the third reason, and it is the sharpest one:
+  // OUR OWN PRODUCT SETS THEM. A machine running the launcher exports
+  // SSL_CERT_FILE / REQUESTS_CA_BUNDLE / NODE_EXTRA_CA_CERTS into the developer's
+  // shell, so the cases that assert "this must stay UNSET" or "this must point at
+  // the bundle WE built" were reading the host's wiring instead of the fixture's.
+  // Measured 2026-08-18 at 6d20f0c: 7 of 44 red on a developer machine, green on
+  // CI, entirely because CI's shell has no trust wiring. All three were set —
+  // one to a chained proxy's bundle, one to the distro store, one to the merged
+  // ca-trust.pem this launcher itself publishes.
+  // A suite that only passes on a machine that does NOT run the thing under test
+  // is not testing the thing under test.
   for (const k of ["CACHE_FIX_PROXY_PORT", "CACHE_FIX_PROXY_UPSTREAM", "NO_PROXY", "no_proxy",
-                   "CACHE_FIX_CA_PROBE_UNANSWERABLE"]) delete env[k];
+                   "CACHE_FIX_CA_PROBE_UNANSWERABLE",
+                   "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+                   "CURL_CA_BUNDLE"]) delete env[k];
   env.CACHE_FIX_PROXY_BIND = "127.0.0.1";
   // A config dir per invocation, by DEFAULT — not opt-in per test. Forward mode
   // publishes our CA into <config>/ca-trust.d/ccf.pem, so any test that forgot to
@@ -124,6 +147,46 @@ const NODE = process.execPath;
 // exits. Two ca-trust tests below run the wrapper TWICE against one config dir
 // (first launch publishes our CA, second reads the bundle built from it), which
 // is what makes a named helper worth it over the inline fork the older tests use.
+// `close`, not `exit`: exit fires when the process is gone, close when its
+// stdio has also been drained. Measured under the concurrency this file now
+// runs at — an exit-resolved run came back with bytesRead=0 and
+// readableEnded=false while the child had provably run and written, so the
+// assertion read an empty string the child had in fact produced. One helper
+// because that judgement was previously repeated at fifteen call sites, which
+// is why correcting it had to touch all fifteen.
+const waitClose = (p) => new Promise((res) => {
+  const t = setTimeout(() => { p.kill("SIGTERM"); res(null); }, 15_000);
+  p.on("close", (c) => { clearTimeout(t); res(c); });
+});
+
+// LIVES HERE, NOT IN bin/. Its only caller is the fixture below, and
+// production stopped having one when the launcher's replace-class write was
+// deleted — shipping it in bin/ made it dead API on every install. Moved
+// rather than deleted: the fixture has to build its bundle the way the real
+// builder does, ambient store first, and inlining platform detection at the
+// call site is what this function exists to avoid.
+// Where this platform keeps the trust store an unset SSL_CERT_FILE falls back
+// to. Returns null when there is no FILE to compare against — macOS keeps it in
+// the keychain, which is not enumerable this cheaply, and "cannot name it" must
+// read as "cannot prove", never as "nothing to lose".
+function ambientStorePath() {
+  // NOT process.env.SSL_CERT_FILE: that is the CLIENT's value, which the caller
+  // already compares against separately. Reading it here would compare a value
+  // to itself and always answer yes.
+  for (const p of [
+    "/etc/ssl/certs/ca-certificates.crt",   // debian, ubuntu, most containers
+    "/etc/pki/tls/certs/ca-bundle.crt",     // rhel, fedora
+    "/etc/ssl/cert.pem",                    // alpine, AND macOS: the system roots
+                                            // exported in OpenSSL form. Measured 128
+                                            // certs on two Macs — so macOS is provable
+                                            // here, not a platform we have to skip.
+  ]) {
+    if (!p) continue;
+    try { if (statSync(p).size > 0) return p; } catch { /* next */ }
+  }
+  return null;
+}
+
 async function runWrapper(script, overrides) {
   const p = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
     stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -132,14 +195,30 @@ async function runWrapper(script, overrides) {
   let out = "", err = "";
   p.stdout.on("data", (c) => { out += c.toString(); });
   p.stderr.on("data", (c) => { err += c.toString(); });
-  const code = await new Promise((res) => {
-    p.on("exit", res);
-    setTimeout(() => { p.kill("SIGTERM"); res(null); }, 15000);
-  });
-  return { code, out, err };
+  return { code: await waitClose(p), out, err };
 }
 
-describe("launch wrapper (claude-via-proxy)", () => {
+// Concurrent, but BOUNDED BY CORES: each case boots a real proxy under its own
+// 10s startup budget, and unbounded concurrency blew that budget on the CI
+// runner — measured, "Proxy failed to start within 10s" on every node, while a
+// 48-core box passed every time. Serial, the file pays the sum of the waits; at
+// half the cores it pays close to the longest one without starving any boot.
+//
+// availableParallelism(), NOT cpus().length — see the same bound in
+// proxy-held-port.test.mjs for the measurement, for what this does and does not
+// fix, and for why the runner's core count is deliberately not claimed. Short
+// version: cpus() counts the machine and ignores this process's CPU affinity,
+// so under `--cpuset-cpus=0,1` it reports 48 and this bound stops bounding
+// anything. No change on CI, where there is no mask and both calls agree.
+//
+// THE FLOOR IS 1. `Math.max(2, ...)` used to defeat the halving on exactly the
+// machines it exists for — floor(2/2) is 1, so a two-core runner computed 2 and
+// booted two real proxies at once. Identical on any box with 4+ cores, which is
+// why it survived every local run. Arithmetic, not a CI fix: it was proposed as
+// one and suite-collection.test.mjs records that hypothesis REJECTED.
+const CONCURRENCY = Math.max(1, Math.floor(availableParallelism() / 2));
+
+describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () => {
   it("exits with error when claude command is not found", async () => {
     const wrapperProc = fork(WRAPPER_PATH, ["--proxy-port", "0"], {
       stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -149,10 +228,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     let stderr = "";
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.ok(code !== 0, `Wrapper should exit non-zero. stderr: ${stderr}`);
   });
@@ -167,10 +243,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     let stdout = "";
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.ok(stdout.includes("BASE_URL=http://127.0.0.1:"), `Expected BASE_URL in output, got: ${stdout}`);
     assert.equal(code, 0);
@@ -185,10 +258,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     let stderr = "";
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 42, `Expected exit 42, got ${code}. stderr: ${stderr}`);
   });
@@ -218,10 +288,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     assert.ok(stdout.includes("BASE=UNSET"), `ANTHROPIC_BASE_URL should be unset in forward mode, got: ${stdout}`);
@@ -249,10 +316,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     // The CA must be the override path exactly, not the default ~/.claude one.
@@ -288,10 +352,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     // The child already ran and exited, so anything on disk now was written
@@ -327,6 +388,182 @@ describe("launch wrapper (claude-via-proxy)", () => {
     assert.ok(second.out.includes(`CA=${bundle}`), `NODE_EXTRA_CA_CERTS should be the merged bundle (${bundle}), got: ${second.out}`);
   });
 
+  // ONE launcher run for the two cases below. Each used to open with its own
+  // identical "run once so the proxy mints and publishes our CA" pass, which is
+  // two extra launcher+proxy pairs in a file node:test already runs concurrently
+  // with the timing cases in proxy-held-port.test.mjs. Those cases lose their
+  // windows to exactly this kind of neighbour load — measured, CI went red on a
+  // different one of them each run.
+  let pyTrust;
+  const pythonTrustFixture = async () => {
+    if (pyTrust) return pyTrust;
+    const configDir = tempDir("cfftrust-");
+    const bundle = join(configDir, "ca-trust.pem");
+    const first = await runWrapper('process.stdout.write("x")', { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(first.code, 0, `fixture run should exit 0, got ${first.code}. stderr: ${first.err}`);
+    const ourPem = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
+    // Built the way the real builder builds it: the AMBIENT store first, then
+    // each component. A components-only fixture is a different machine — the one
+    // the "carries no ambient roots" case covers — and the launcher now
+    // correctly refuses to point python at it.
+    const ambient = ambientStorePath();
+    assert.ok(ambient, "this platform has no ambient CA file, so this case cannot establish its premise");
+    writeFileSync(bundle, `${readFileSync(ambient, "utf8")}\n${ourPem}`);
+    pyTrust = { configDir, bundle, ourPem };
+    return pyTrust;
+  };
+
+  // THE REPLACE-CLASS VARIABLES ARE NOT OURS TO WRITE — not gated, ABSENT.
+  //
+  // These two cases used to assert the opposite: that we set SSL_CERT_FILE and
+  // REQUESTS_CA_BUNDLE whenever a fingerprint-set subsumption proof passed, and
+  // kept the operator's value when it did not. The proof worked. It was still
+  // the wrong design, because a proof taken at launch outlives the thing it
+  // proved: the store can be rotated, revoked, made unreadable, or replaced by
+  // MDM, and the variable stays behind naming a bundle that no longer subsumes
+  // anything. On a corporate laptop that is total — system roots gone, no
+  // internet, every enterprise function dead, while our proxy keeps working so
+  // the tool still looks healthy.
+  //
+  // Two independent implementations of that gate each shipped a default-ALLOW
+  // arm (ours said ok on an UNREADABLE store; cswap-pin's passed when the
+  // ambient roots were a capath with no cafile), which is the shape of the
+  // class rather than two bugs.
+  //
+  // A python client that must trust this proxy adds the CA in code —
+  // ssl.create_default_context() then load_verify_locations() — which cannot
+  // narrow trust on any platform.
+  it("--remote-control never writes a replace-class trust variable", async () => {
+    const { configDir, bundle } = await pythonTrustFixture();
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")'
+      + '+"|SSL="+(process.env.SSL_CERT_FILE||"UNSET")'
+      + '+"|REQ="+(process.env.REQUESTS_CA_BUNDLE||"UNSET")'
+      + '+"|CURL="+(process.env.CURL_CA_BUNDLE||"UNSET")+"\\n")';
+
+    // Nothing inherited, so anything that appears was written by the launcher.
+    const clean = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(clean.code, 0, `Expected exit 0, got ${clean.code}. stderr: ${clean.err}`);
+    assert.ok(clean.out.includes(`CA=${bundle}`),
+      `the ADD-class variable is still ours to set, got: ${clean.out}`);
+    for (const key of ["SSL", "REQ", "CURL"]) {
+      assert.ok(clean.out.includes(`${key}=UNSET`),
+        `${key} is replace-class and must never be written; got: ${clean.out}`);
+    }
+  });
+
+  it("--remote-control leaves an operator's replace-class values exactly as it found them", async () => {
+    const { configDir, ourPem } = await pythonTrustFixture();
+    const script = 'process.stdout.write("SSL="+(process.env.SSL_CERT_FILE||"UNSET")'
+      + '+"|REQ="+(process.env.REQUESTS_CA_BUNDLE||"UNSET")+"\\n")';
+    // A value we COULD prove we subsume — under the old design this is exactly
+    // the input that got overwritten. It must now survive untouched, which is
+    // what separates "we deleted the write" from "the proof happens to refuse".
+    const theirs = join(configDir, "operator-trust.pem");
+    writeFileSync(theirs, ourPem);
+
+    const res = await runWrapper(script, {
+      CLAUDE_CONFIG_DIR: configDir,
+      SSL_CERT_FILE: theirs,
+      REQUESTS_CA_BUNDLE: theirs,
+    });
+    assert.equal(res.code, 0, `Expected exit 0, got ${res.code}. stderr: ${res.err}`);
+    assert.ok(res.out.includes(`SSL=${theirs}`), `SSL_CERT_FILE was modified: ${res.out}`);
+    assert.ok(res.out.includes(`REQ=${theirs}`), `REQUESTS_CA_BUNDLE was modified: ${res.out}`);
+  });
+
+
+  it("--remote-control leaves the python vars alone when the bundle carries no ambient roots", async () => {
+    // "The merged bundle is a superset by construction" is FALSE. It is a
+    // superset of the ambient corporate store only when the builder found one.
+    // Measured across this fleet, ~/.claude/ca-trust.pem:
+    //   a Linux box     127 certs, 2 components, 125 ambient
+    //   a work Mac      168 certs, 2 components, 166 ambient
+    //   a personal Mac    2 certs, 2 components,   0 ambient   <- no corp store
+    // On the last one the merged bundle IS the two component CAs, so pointing
+    // SSL_CERT_FILE at it leaves a python client trusting our proxies and
+    // nothing else — the lone-CA bug again, through the door we had just
+    // declared safe.
+    //
+    // So the gate is a PROOF, not a shape: the bundle must subsume the ambient
+    // store. A bundle of components only cannot, and the vars stay untouched.
+    const configDir = tempDir("cffnoamb-");
+    const bundle = join(configDir, "ca-trust.pem");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")'
+      + '+"|SSL="+(process.env.SSL_CERT_FILE||"UNSET")+"\\n")';
+
+    const first = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+    // A components-only bundle: exactly what that Mac has.
+    writeFileSync(bundle, readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8"));
+
+    const res = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(res.code, 0, `Expected exit 0, got ${res.code}. stderr: ${res.err}`);
+    assert.ok(res.out.includes(`CA=${bundle}`),
+      `NODE_EXTRA_CA_CERTS should still take the bundle (node merges), got: ${res.out}`);
+    assert.ok(res.out.includes("SSL=UNSET"),
+      `SSL_CERT_FILE must stay unset when the bundle carries no ambient roots, got: ${res.out}`);
+  });
+
+  it("--remote-control never makes its own CA the whole python trust world", async () => {
+    // The standalone case, and the one that makes this dangerous rather than
+    // merely incomplete. With no merged bundle the launcher hands claude OUR CA
+    // ALONE — correct for NODE_EXTRA_CA_CERTS, which node MERGES with its
+    // built-in store, and catastrophic for SSL_CERT_FILE, which urllib does not
+    // merge but REPLACES. Naming a one-certificate file there leaves a python
+    // client trusting exactly our proxy and nothing else on the internet.
+    //
+    // So the two python vars are gated on handing over the MERGED bundle, not on
+    // having any CA at all. The bundle is the ambient store plus each component,
+    // hence a superset; our own CA is not a superset of anything.
+    //
+    // Found from the other side: a peer is about to write SSL_CERT_FILE too, and
+    // asking which of us wins surfaced that CCF's own fallback was the loser.
+    const configDir = tempDir("cffsolo-");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")'
+      + '+"|SSL="+(process.env.SSL_CERT_FILE||"UNSET")+"\\n")';
+
+    // No ca-trust.pem is ever written here, so the launcher takes the fallback.
+    const res = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(res.code, 0, `Expected exit 0, got ${res.code}. stderr: ${res.err}`);
+    assert.match(res.out, /CA=\S*cache-fix-ca\/ca\.pem/,
+      `NODE_EXTRA_CA_CERTS should still be our own CA, got: ${res.out}`);
+    assert.ok(res.out.includes("SSL=UNSET"),
+      `SSL_CERT_FILE must NOT become our one-cert CA, got: ${res.out}`);
+  });
+
+  it("--remote-control leaves the ambient python trust vars alone when it has no usable CA", async () => {
+    // The other half of the contract. With no usable CA we hand claude nothing
+    // and let it fall back to the ambient store — so we must not have pointed
+    // python at a file we then refused to vouch for, and equally must not have
+    // deleted a REQUESTS_CA_BUNDLE the user configured. Whatever came in, comes
+    // out.
+    const configDir = tempDir("cfftrust-");
+    const ambient = join(configDir, "operator-configured.pem");
+    writeFileSync(ambient, "# the user's own bundle\n");
+    // An UNPARSEABLE ca.pem is the only reachable way to make caForClaude null;
+    // the sibling test at "does not hand claude a ca.pem that failed to parse"
+    // uses the same fixture. An absent CA dir does NOT work — the launcher mints
+    // into it and then correctly wires all three. Measured: that first draft of
+    // this test asserted UNSET and got the freshly minted ca.pem, i.e. it was
+    // encoding a premise that does not exist rather than the contract.
+    const caDir = tempDir("cffca-");
+    writeFileSync(join(caDir, "ca.key"), "-----BEGIN PRIVATE KEY-----\nplaceholder\n-----END PRIVATE KEY-----\n");
+    writeFileSync(join(caDir, "ca.pem"), "-----BEGIN CERTIFICATE-----\ntruncated\n");
+    const script = 'process.stdout.write("SSL="+(process.env.SSL_CERT_FILE||"UNSET")'
+      + '+"|REQ="+(process.env.REQUESTS_CA_BUNDLE||"UNSET")+"\\n")';
+
+    const res = await runWrapper(script, {
+      CLAUDE_CONFIG_DIR: configDir,
+      CACHE_FIX_CA_DIR: caDir,
+      SSL_CERT_FILE: ambient,
+      REQUESTS_CA_BUNDLE: ambient,
+    });
+
+    assert.equal(res.code, 0, `Expected exit 0, got ${res.code}. stderr: ${res.err}`);
+    assert.ok(res.out.includes(`SSL=${ambient}`), `SSL_CERT_FILE must survive untouched, got: ${res.out}`);
+    assert.ok(res.out.includes(`REQ=${ambient}`), `REQUESTS_CA_BUNDLE must survive untouched, got: ${res.out}`);
+  });
+
   it("--remote-control never writes the merged bundle and never touches a sibling component's pem", async () => {
     // Single-writer invariant. Two launchers both "helpfully" rebuilding the
     // merged file race one output, and a component that rewrites a sibling's pem
@@ -346,10 +583,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     let stderr = "";
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     assert.equal(readFileSync(sibling, "utf8"), SIBLING_BYTES, "sibling component's pem must be untouched");
@@ -457,10 +691,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     assert.ok(
@@ -540,10 +771,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     let stderr = "";
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     clearInterval(sampler);
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
@@ -773,7 +1001,18 @@ describe("launch wrapper (claude-via-proxy)", () => {
     writeFileSync(join(caDir, "ca.pem"), "-----BEGIN CERTIFICATE-----\ntruncated\n");
 
     const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
-    const { out } = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir, CACHE_FIX_CA_DIR: caDir });
+    // AN EXPLICIT AMBIENT VALUE, because cleanEnv strips this from the base env.
+    // The contract under test is the launcher's `else delete
+    // claudeEnv.NODE_EXTRA_CA_CERTS` arm — "no usable CA means claude gets none,
+    // so node falls back to its built-in store". With the var merely ABSENT,
+    // CA=UNSET is the fixture's own starting state and the assertion cannot fail
+    // on that arm: measured, replacing the delete with `{ }` still passed 44/44.
+    // Setting it first makes UNSET something the launcher had to DO.
+    const { out } = await runWrapper(script, {
+      CLAUDE_CONFIG_DIR: configDir,
+      CACHE_FIX_CA_DIR: caDir,
+      NODE_EXTRA_CA_CERTS: "/nonexistent/ambient-ca.pem",
+    });
 
     assert.match(out, /CA=UNSET/,
       `claude must not be pointed at an unparseable CA; got: ${out.trim()}`);
@@ -803,10 +1042,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     const handed = (stdout.match(/CA=(.*)/) || [])[1];
@@ -927,10 +1163,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     // Both NO_PROXY and no_proxy must cover localhost.
@@ -953,10 +1186,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     assert.ok(stdout.includes("example.com"), `existing NO_PROXY entry should be preserved, got: ${stdout}`);
@@ -977,10 +1207,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     assert.ok(stdout.includes("corp.internal"), `lowercase no_proxy entry should be preserved, got: ${stdout}`);
@@ -999,10 +1226,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     // 127.0.0.1 must appear exactly once, not duplicated, and localhost still added.
@@ -1032,7 +1256,8 @@ describe("launch wrapper (claude-via-proxy)", () => {
       await new Promise((res) => setTimeout(res, 50));
     }
     p.kill("SIGTERM");
-    await new Promise((res) => p.on("exit", res));
+    await withDeadline(new Promise((res) => p.on("exit", res)),
+      30_000, p, "the forward-proxy fork never exited after SIGTERM");
 
     assert.match(err, /export NODE_EXTRA_CA_CERTS=/,
       `a non-launcher fork must still be told how to wire; stderr: ${err}`);
@@ -1558,6 +1783,41 @@ describe("launch wrapper (claude-via-proxy)", () => {
     // never held.
     assert.ok(!/keeping it/.test(err),
       `reported keeping a merge it did not keep. got stderr: ${err}`);
+  });
+
+
+  // A fork() THAT NEVER STARTS MUST STILL CLEAN UP AND SAY WHY.
+  //
+  // fork() reports EACCES, EAGAIN, EMFILE, ENFILE and ENOENT by EMITTING
+  // 'error' on the ChildProcess rather than throwing, and an 'error' with no
+  // listener is an uncaughtException. This site had only an 'exit' handler, and
+  // 'exit' does NOT fire on a failed spawn — measured on 18.20.8 / 20.20.2 /
+  // 24.11.1, the events are ["error:ENOENT", "close:-2/null"]. So a proxy that
+  // could not be forked printed a node stack instead of this file's own message
+  // and skipped cleanup() entirely.
+  //
+  // Lifted and run rather than grepped: a grep for `proxyProc.on("error"` passes
+  // on a handler that does nothing, and doing nothing here is the failure.
+  it("reports a proxy that could not be forked, and still cleans up", () => {
+    const src = readFileSync(WRAPPER_PATH, "utf8");
+    const handler = /proxyProc\.on\("error", \(err\) => \{[\s\S]*?\n\}\);/.exec(src)?.[0];
+    assert.ok(handler, "the fork error handler is gone — a failed fork is an uncaughtException again");
+
+    const said = [], exits = [];
+    let cleaned = 0, onError = null;
+    const proxyProc = { on: (ev, fn) => { if (ev === "error") onError = fn; } };
+    const proc = { stderr: { write: (x) => said.push(x) }, exit: (c) => exits.push(c) };
+    // eslint-disable-next-line no-new-func
+    Function("proxyProc", "cleanup", "process", handler)(proxyProc, () => cleaned++, proc);
+    assert.ok(onError, "the lifted handler registered nothing");
+
+    onError(Object.assign(new Error("spawn EAGAIN"), { code: "EAGAIN" }));
+    assert.match(said.join(""), /EAGAIN/,
+      "the errno was not reported, so the only clue why the proxy never started is missing");
+    assert.equal(cleaned, 1,
+      "cleanup() was skipped on a failed fork — the exit path this file relies on never ran");
+    assert.deepEqual(exits, [1],
+      "a wrapper whose proxy never started must not exit 0; a caller reads that as success");
   });
 
 });

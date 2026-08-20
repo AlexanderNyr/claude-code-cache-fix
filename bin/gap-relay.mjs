@@ -1,0 +1,468 @@
+#!/usr/bin/env node
+// Accept on the socket handed down as fd 3 and CARRY, for as long as nothing
+// better is serving that address.
+//
+// Its own file, and a separate PROCESS, for one measured reason each. A process
+// because a second socket cannot be had: binding a port again is refused while
+// anything is listening on it (EADDRINUSE on linux and darwin alike), and that
+// is exactly the state a dead child leaves behind — socket listening, nobody
+// accepting, every client waiting out its own timeout. Inheriting the
+// descriptor has no bind in it, so it works in every state the port can be in.
+// Its own file because the launcher treats an unrecognised subcommand as
+// arguments for claude, so a dispatch branch there is never reached.
+//
+// It carries rather than merely answering: to the fallback hop when there is
+// one, and straight to the origin by terminating CONNECT when there is not.
+// "Everything off" is a real state on these machines, and a session's
+// HTTPS_PROXY is fixed at exec — so this address has to finish the request.
+//
+// AND ITS OWN LOG MUST NOT BE ABLE TO KILL IT. openGap spawns this with stderr
+// "inherit", so it shares the holder's pipe — and it writes to that pipe on
+// every unusable hop, on a server error, and on arming. When the pipe's last
+// reader dies (the measured case: a `... | tee` killed during cleanup), the
+// next write raises EPIPE as an asynchronous 'error' event with no listener,
+// which Node promotes to uncaughtException. The one process whose entire job is
+// to keep this socket answering would then exit because a log line had nowhere
+// to go. proxy/server.mjs took this guard in 94e1953; this file and the
+// launcher were not swept for it at the time.
+import net from "node:net";
+import tls from "node:tls";
+
+for (const s of [process.stdout, process.stderr]) {
+  s.on("error", () => { /* the reader left; carrying the socket is the job */ });
+}
+
+// OUR OWN ADDRESS IS NEVER A HOP. `fallbackProxyUrls()` drops it for a reason
+// the fallback suite pins — a request routed there comes straight back — and the
+// shipped list can legitimately BEGIN with self. Taking `[0]` raw meant an armed
+// relay forwarded to itself: measured on one CONNECT, the relay's descriptor
+// count went 22 -> 8,195 -> 22,733 -> 29,814 and kept climbing, so the address
+// is destroyed rather than degraded, in the one state where nothing else is left
+// to serve it.
+const mine = new Set();
+{
+  const held = process.env.CACHE_FIX_HELD_PORT;
+  // The host we are BOUND to as well as loopback: a non-loopback bind plus a
+  // fallback naming this box's own address is the same self-forward by another
+  // name. And the bare host for 80/443, because `new URL` drops a default port
+  // from `.host` and the comparison would never match.
+  if (held) {
+    for (const h of ["127.0.0.1", "localhost", "[::1]", process.env.CACHE_FIX_HELD_HOST].filter(Boolean)) {
+      mine.add(`${h}:${held}`);
+      if (held === "80" || held === "443") mine.add(h);
+    }
+  }
+}
+// Same precedence the proxy uses — config.httpsProxy first, then the fallback
+// list — because a host wired with only CACHE_FIX_UPSTREAM_PROXY has a hop this
+// would otherwise not see, and would dial origins direct, straight into a
+// corporate MITM, while /health on that same host named the corp proxy.
+//
+// `new URL` and http(s) only, matching upstream.mjs: a value it rejects is not a
+// hop there either, and the protocol check is what keeps `user:pass@host:port` —
+// which URL reads as the scheme `user:` — from becoming one, or from reaching
+// /health below.
+// EVERY usable candidate, in order — not the first one only.
+//
+// This took the first and fell straight to direct when it would not carry, so a
+// configured second hop was never tried. proxy/upstream.mjs resolveHop() walks
+// the whole list, which made one chain carry two different definitions of what
+// "the chain" is — and the relay's copy is the one that runs precisely when the
+// proxy is down. cswap's pin walks its own candidates the same way, treats a
+// refusal as "refused BY this hop", and reaches direct only when none will
+// carry.
+//
+// NOT a hard close when none carries: their measurement is that closing there
+// trades an invisible fall-open for an invisible outage, and this tunnel is the
+// most expensive place to take one. Direct stays the last resort, and the
+// refusals are traced so it is not a silent one.
+const hopUrls = (() => {
+  // HTTP_PROXY IS PART OF THE CHAIN, in the order proxy/config.mjs reads it.
+  // This list omitted it while config.mjs resolves an https upstream as
+  // CACHE_FIX_UPSTREAM_PROXY -> HTTPS_PROXY -> https_proxy and upstream.mjs
+  // documents the fallback to HTTP_PROXY when HTTPS_PROXY is unset. An operator
+  // who sets only HTTP_PROXY -- the ordinary single-variable setup -- therefore
+  // had a proxy that used it and a relay that saw no chain at all and went
+  // direct. That is exactly the "one chain, two definitions" this block's own
+  // comment forbids, and it fires on the path that runs while the proxy is
+  // down.
+  const candidates = [process.env.CACHE_FIX_UPSTREAM_PROXY,
+                      process.env.HTTPS_PROXY, process.env.https_proxy,
+                      process.env.HTTP_PROXY, process.env.http_proxy,
+                      ...(process.env.CACHE_FIX_FALLBACK_PROXIES || "").split(",")];
+  const out = [], seen = new Set();
+  for (const raw of candidates) {
+    const v = (raw || "").trim();
+    if (!v) continue;
+    try {
+      const u = new URL(v);
+      if (u.protocol !== "http:" && u.protocol !== "https:") continue;
+      if (mine.has(u.host)) continue;
+      if (seen.has(u.host)) continue;   // the same hop named twice is one hop
+      seen.add(u.host);
+      out.push(u);
+    } catch { /* not a hop; try the next */ }
+  }
+  return out;
+})();
+const hopUrl = hopUrls[0] || null;
+const portOf = (u) => Number(u.port) || (u.protocol === "https:" ? 443 : 80);
+// Address only, never the credentials: a hop URL may carry them (cswap's pin
+// publishes its own as cswap:<token>@127.0.0.1:53749) and this goes into a
+// /health body that anything able to reach the port can read.
+const hopAddress = hopUrl ? `${hopUrl.protocol}//${hopUrl.host}` : null;
+
+const srv = net.createServer((client) => {
+  // A client that connects and never speaks would hold a descriptor for as long
+  // as this process lives. Cleared on the first byte, so an idle CONNECT tunnel
+  // — normal, and legitimately long — is never touched by it.
+  const mute = setTimeout(() => client.destroy(), 30_000);
+  let up = null;
+  const bail = () => { up?.destroy(); client.destroy(); };
+  client.on("error", bail);
+  // CLOSE, not just error, on both sides. `pipe()` does not end a destination
+  // whose source was DESTROYED rather than ended, and between a CONNECT 200 and
+  // the first TLS byte neither side is writing, so nothing errors either — the
+  // shape where an upstream can be left behind. forward-proxy.mjs guards the
+  // same hazard for the same reason ("dialling for a dead socket leaks the
+  // upstream connection").
+  //
+  // A review reported 20 leaked descriptors from 20 aborted tunnels here. I
+  // could NOT reproduce it, at this commit or with these two lines removed: the
+  // relay's own fd table stayed at one socket, its listener. So these are a
+  // guard against a shape that is real in principle, not the fix for a leak
+  // measured in this code — and there is no case below that kills them.
+  //
+  // It is worth the three lines anyway: this process exits(1) on an accept
+  // error, so at an EMFILE ceiling the standby would drop the last descriptor on
+  // the socket and the ADDRESS would die, from the one process meant to be the
+  // last line of defence.
+  client.on("close", () => up?.destroy());
+  // THE HEADER BLOCK, NOT THE FIRST CHUNK. This routed off whatever bytes
+  // happened to arrive together, and a request line split across TCP segments
+  // then matched neither pattern: a /health probe read as not-health, and a
+  // CONNECT fell to direct() where the regex failed and the client was destroyed
+  // with nothing written anywhere. withHopAuth has the same dependency and
+  // already says so -- it returns the chunk unchanged when the block is
+  // incomplete, so a split CONNECT reached an authenticated hop with no
+  // credentials and got 407.
+  //
+  // The launcher's twin of this was fixed in this same branch ("reads the
+  // child's announcements as whole lines, at any chunk boundary"); this is the
+  // sibling that was left. Accumulate to the blank line, which is what BOTH the
+  // routing and the auth rewrite need, and keep the mute timer armed until then:
+  // a client that sends half a request and stops is stalled, not idle, and the
+  // 30s is the only thing that reclaims it.
+  //
+  // The ceiling is a bound on memory, not a protocol rule. Past it we route on
+  // what we have, which fails the patterns below and closes -- the same outcome
+  // as before, reached deliberately.
+  const HEAD_MAX = 64 * 1024;
+  let acc = Buffer.alloc(0);
+  const onHead = (chunk) => {
+    acc = Buffer.concat([acc, chunk]);
+    if (acc.indexOf("\r\n\r\n") < 0 && acc.length < HEAD_MAX) return;
+    client.off("data", onHead);
+    handleHead(acc);
+  };
+  const handleHead = (first) => {
+    // PAUSE, or every byte after this chunk is lost. Removing the last `data`
+    // listener does NOT stop a flowing stream, so whatever arrives between here
+    // and the pipe below is emitted to nobody. Measured on this exact shape: a
+    // request whose body followed its headers reached the hop with an empty
+    // body and hung waiting for a Content-Length that never came. pipe()
+    // resumes, so the buffered bytes go out in order.
+    client.pause();
+    const line = String(first).split("\r\n")[0];
+    // /health, answered 503, and both halves are load-bearing.
+    //
+    // /health because the standby below has to ask a question a real proxy also
+    // answers — a private path would be silence from a live proxy, and silence
+    // is its cue to start accepting beside one. Measured: the proxy closes on an
+    // unknown path without a byte.
+    //
+    // 503 because THIS ADDRESS IS NOT WELL, and every readiness check in the
+    // tree reads /health. Answering 200 made a fixture take a relay for a proxy
+    // and run 1.3s before one existed. `curl -sf` fails on 503, so the checks
+    // that gate a deploy keep saying no, which is the truth: traffic is moving
+    // and nothing is caching it.
+    if (/^GET\s+\/health\b/.test(line)) {
+      // The timer is deliberately NOT cleared on this path: `end()` half-closes,
+      // and a peer that never closes back would hold this descriptor for the
+      // life of the process — one per probe, and the standby probes forever.
+      client.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n"
+                 + JSON.stringify({ carrying: "gap-relay", https_proxy: hopAddress }));
+      return;
+    }
+    clearTimeout(mute);
+    // Straight to the origin, terminating CONNECT ourselves: the route when no
+    // hop is configured, and the route when the configured one is gone. CONNECT
+    // ONLY — with no hop there is nothing to hand an absolute-form request to,
+    // and every call this stands in for is HTTPS.
+    const direct = () => {
+      const c = /^CONNECT\s+([^\s:]+):(\d+)/i.exec(line);
+      if (!c) return void client.destroy();
+      // REQUIRE_HOP=1 OVERRIDES THE FALL-THROUGH ABOVE, and this is the one
+      // place that can enforce it: both callers reach direct() unconditionally,
+      // so a guard at either would leave the other open — and the next caller
+      // written would have to remember it too.
+      //
+      // The fall-through is deliberate and argued at the top of this file: not
+      // carrying "trades an invisible fall-open for an invisible outage, and
+      // this tunnel is the most expensive place to take one". That holds while
+      // nobody has said otherwise. This flag IS the operator saying otherwise —
+      // for them the fall-open is the worse half — and the live proxy already
+      // honours it in two places (forward-proxy.mjs:319,372; upstream.mjs:453).
+      //
+      // We carry the address only during holder transitions, i.e. every deploy,
+      // so unguarded this was a policy hole that opened exactly while the
+      // zero-downtime path did its work and closed before anyone looked.
+      //
+      // 502 AND NOT A SILENT CLOSE: pin reads a non-200 CONNECT reply as
+      // "refused BY this hop, walk past us", which is the behaviour a refusal
+      // owes its client. The same status the live proxy answers with.
+      if (process.env.CACHE_FIX_REQUIRE_HOP === "1") {
+        process.stderr.write(
+          `[gap-relay] no chain hop reachable and CACHE_FIX_REQUIRE_HOP=1 — ` +
+          `refusing ${c[1]}:${c[2]}\n`);
+        return void client.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      }
+      up = net.connect(Number(c[2]), c[1]);
+      up.on("error", bail);
+      up.on("close", () => client.destroy());
+      up.on("connect", () => {
+        client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        client.pipe(up); up.pipe(client);
+      });
+    };
+    if (!hopUrls.length) return void direct();
+
+    // A CONFIGURED HOP THAT IS DOWN IS NOT THE END OF THE LINE. The hop is read
+    // once at startup, so "privoxy is off too" leaves this pointing at a port
+    // that refuses — and refusing every request is the state we exist to
+    // prevent. Measured before this fell through: CCF off and the hop stopped
+    // gave ECONNRESET on every request, at 1ms, forever.
+    //
+    // Only BEFORE the tunnel opens. Once bytes are flowing the client is inside
+    // an established tunnel and there is nothing to re-dial — a second attempt
+    // would replay a request the hop may already have acted on.
+    //
+    // A hop speaks the same protocol we were handed, so CONNECT and
+    // absolute-form both pass through untouched, including the chunk we had to
+    // read to get here.
+    // One attempt per hop, in order. `i` is the only state the walk needs.
+    let i = 0;
+    const tryHop = () => {
+      if (i >= hopUrls.length) return void direct();
+      const u = hopUrls[i++];
+      dial(u);
+    };
+    // A HOP URL'S userinfo IS CREDENTIALS FOR THE HOP, and nothing was
+    // presenting them. We write the CLIENT'S CONNECT bytes through verbatim, so
+    // an authenticated hop answered 407 — and `carried` is already true by then
+    // (set on TCP connect, before any hop reply), so the 407 went straight back
+    // to a client whose chain was configured correctly.
+    //
+    // REPLACED, not appended: a Proxy-Authorization the client sent was
+    // addressed to US, not to the hop behind us, so forwarding it would present
+    // the wrong identity and a duplicate header.
+    //
+    // decodeURIComponent because URL percent-encodes userinfo, so a password
+    // containing `@` or `:` arrives escaped and must be sent raw.
+    //
+    // NEVER LOGGED. This function returns bytes and reports nothing; the sibling
+    // finding in this same round was a hop password reaching a mode-644 file,
+    // and the fix for it is worth nothing if the fix beside it re-leaks.
+    //
+    // latin1 round-trips arbitrary bytes; the header block is ASCII by spec and
+    // the body after CRLFCRLF is copied through untouched.
+    const withHopAuth = (chunk, u) => {
+      if (!u.username && !u.password) return chunk;
+      const text = chunk.toString("latin1");
+      const end = text.indexOf("\r\n\r\n");
+      if (end < 0) return chunk;      // headers not complete in this chunk
+      const cred = Buffer.from(
+        `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString("base64");
+      const head = text.slice(0, end).split("\r\n")
+        .filter((l) => !/^proxy-authorization:/i.test(l));
+      head.push(`Proxy-Authorization: Basic ${cred}`);
+      return Buffer.from(head.join("\r\n") + text.slice(end), "latin1");
+    };
+
+    const dial = (u) => {
+    // TLS TO A https:// HOP. net.connect dialled it in PLAINTEXT on :443 —
+    // portOf() already defaulted the port from the scheme, so the address was
+    // right and only the transport was wrong, which is why this was invisible.
+    // A TLS listener never answers an HTTP request line, so the CONNECT sat
+    // until the 2s dial deadline below and the walk moved on, reporting the hop
+    // "unusable" when it was fine and we were speaking the wrong protocol to it.
+    // proxy/forward-proxy.mjs had the same defect at both of its CONNECT sites;
+    // this is the third copy of one chain.
+    const secure = u.protocol === "https:";
+    const hopSock = secure
+      ? tls.connect({ host: u.hostname, port: portOf(u), servername: u.hostname })
+      : net.connect(portOf(u), u.hostname);
+    up = hopSock;
+    let carried = false;
+    // A DEADLINE ON THE DIAL. The measured fall-through case was a hop that
+    // REFUSED, which is instant; a hop that DROPS — VPN down, a firewalled corp
+    // proxy — costs the kernel's own connect timeout instead, ~130s on linux and
+    // ~75s on darwin. Waiting that out before falling through is the "worse than
+    // a refusal" outcome this path exists to prevent, on the path that prevents
+    // it. Same 2s the standby's own probe uses.
+    hopSock.setTimeout(2_000, () => { if (!carried) hopSock.destroy(new Error("hop dial timed out")); });
+    // REFUSED BY THIS HOP, so try the one behind it — and SAY SO. A relay that
+    // falls through silently is indistinguishable from one that had no chain at
+    // all. Same string proxy/upstream.mjs emits, so one grep reads both.
+    hopSock.on("error", (e) => {
+      hopSock.destroy();
+      if (carried) return void client.destroy();
+      process.stderr.write(`[gap-relay] hop ${u.protocol}//${u.host} unusable (${e?.code || e?.message}) — trying the next\n`);
+      tryHop();
+    });
+    hopSock.on("close", () => { if (carried) client.destroy(); });
+    // READY MEANS THE HANDSHAKE, NOT THE TCP LEG. Measured: a TLSSocket emits
+    // `connect` when the TCP connection is up and only THEN fails verification —
+    //     connect fired (TCP)
+    //     error: DEPTH_ZERO_SELF_SIGNED_CERT
+    // so keying `carried` on `connect` would mark a hop that never completed as
+    // carrying, and the error handler above then destroys the CLIENT instead of
+    // walking to the next hop. `secureConnect` is the first moment a TLS hop can
+    // actually carry. (The write itself is safe either way: measured, bytes
+    // written before the handshake are buffered and delivered after it.)
+    hopSock.on(secure ? "secureConnect" : "connect", () => {
+      carried = true;
+      hopSock.setTimeout(0);          // an established tunnel is allowed to idle
+      hopSock.write(withHopAuth(first, u));
+      client.pipe(hopSock); hopSock.pipe(client);
+    });
+    };
+    tryHop();
+  };
+  // REGISTERED LAST, after handleHead exists. `onHead` closes over it, and a
+  // listener attached before the binding is initialised is a TDZ throw waiting
+  // on the first byte.
+  client.on("data", onHead);
+});
+// WHICH ERROR IT IS DECIDES EVERYTHING, and the old handler treated them alike:
+// `process.exit(1)` on any server error at all.
+//
+//   still listening (EMFILE/ENFILE at accept time) — the descriptor is ours and
+//     the server keeps accepting after it; exiting here would surrender a live
+//     address because the machine briefly ran out of file handles, which is
+//     exactly when the gap we cover is most likely to be open. Stay.
+//
+//   not listening (the listen itself failed) — we have nothing to hold. MEASURED
+//     on this file, fd 3 a pipe so listen fails EINVAL: the child's /proc fd
+//     list comes back without 3, while the same spawn onto a real socket keeps
+//     it. Node closes the descriptor when the listen fails, so "keep the process
+//     alive to retain the fd" is a thing that cannot be done — an earlier draft
+//     of this handler said it did, and the /proc read is what disproved it.
+//     Leaving is then honest and lets openStandby's `lost()` say the port is
+//     unprotected; hanging on would only hide it behind a live pid.
+srv.on("error", (e) => {
+  const held = srv.listening;
+  process.stderr.write(`[cache-fix] gap-relay: ${e.code || e.message} — ` +
+    (held ? "still listening, keeping the socket\n"
+          : "the listen failed, so there is no descriptor left to keep\n"));
+  if (!held) process.exit(1);
+});
+
+const carry = () => srv.listen({ fd: 3 }, () => process.stderr.write("[cache-fix] gap-relay carrying\n"));
+
+// STANDBY — the same relay, spawned once by the holder and then left alone,
+// accepting NOTHING until the holder is gone.
+//
+// A socket outlives every process that served it for as long as any descriptor
+// remains. Measured: killing the holder and its child together left no
+// descriptor at all and the address answered ECONNREFUSED, and a session's
+// HTTPS_PROXY is fixed at exec, so that session is stranded for life. Holding
+// the descriptor is what keeps the address alive; arming is what makes it work.
+//
+// Orphanhood says the holder that would respawn a proxy is gone, so nothing is
+// coming back to compete. Against the parent we were BORN with, not against pid
+// 1: an orphan is only reparented to init where nothing else claims it, and a
+// host running a child-subreaper (systemd --user sets one) would leave this
+// waiting for a 1 that never comes — and a standby that never arms still holds
+// the descriptor, so the address would ACCEPT and hang, which is worse than the
+// refusal it replaced.
+//
+// Silence says nothing is serving RIGHT NOW — which no descriptor scan can tell
+// you, because the holder, the child and this process all hold the same socket
+// and all read as LISTEN. Two acceptors on one descriptor take turns and drop
+// connections (measured: 60 of 125 reset), so the guard has to ask whether
+// anything ANSWERS rather than whether anything is attached. cswap's pin hit the
+// same wall from the other side and wrote it down: a refused-versus-not probe
+// cannot separate "served" from "accepted and queued behind nobody".
+//
+// THREE SHORT WINDOWS, not two long ones, and the difference is what a waiting
+// caller feels. Arming is a one-way door, so it needs evidence; but the evidence
+// is "nothing answered", and a live proxy answers /health in about a millisecond
+// — the seconds were slack for a stalled event loop, not measurement. Three
+// silences at 250ms cost more samples and less waiting than two at 2s: the
+// user-visible stall for a request that arrives in the gap went from ~4.6s to
+// under a second, measured, while the number of independent observations went up.
+//
+// The queue would have been better still — a socket whose acceptor is gone piles
+// connections up, and that is the symptom itself rather than a proxy for it — but
+// darwin reports Recv-Q as 0 for a listening socket, and two of three machines
+// are macs. Measured before choosing this: linux /proc/net/tcp exposes it,
+// `netstat -an` on the mac does not.
+if (process.env.CACHE_FIX_STANDBY !== "1") carry();
+else {
+  // The pid we were HANDED, not the one we can see: `process.ppid` is read tens
+  // of milliseconds after spawn, and a holder that died inside that window has
+  // already been replaced by init — so this would compare 1 against 1 forever
+  // and never arm, while still holding a listening socket. Accept-and-hang.
+  // NO FALLBACK. `Number(env) || process.ppid` used to sit here, and that `||`
+  // reinstates the exact failure the paragraph above describes the moment the
+  // variable goes missing: ppid reads 1 for a holder already reaped, the compare
+  // is 1 against 1 forever, we never arm, and we go on holding a listening
+  // socket that accepts connections and answers none.
+  //
+  // The holder does set it today, so this is unreachable now — and that is the
+  // point: it becomes reachable at the first second spawn site or rename, and
+  // the symptom then is a hung address, which is the hardest shape to diagnose.
+  // Refusing is louder and safer. openStandby's `lost()` already prints "standby
+  // relay gone; the port will not survive this holder" when we exit, so the
+  // operator gets a sentence rather than a silence.
+  const bornOf = Number(process.env.CACHE_FIX_STANDBY_PARENT);
+  if (!Number.isInteger(bornOf) || bornOf <= 1) {
+    process.stderr.write(
+      "[cache-fix] gap-relay: refusing standby — CACHE_FIX_STANDBY_PARENT is unset or " +
+      `not a pid (${JSON.stringify(process.env.CACHE_FIX_STANDBY_PARENT)}). Arming ` +
+      "compares it against our parent, and without it we would hold this socket " +
+      "without ever arming on it.\n");
+    process.exit(1);
+  }
+
+  // TAKE THE ADDRESS THE INSTANT OUR HOLDER IS GONE. No probe, no window, no
+  // decision to wait for.
+  //
+  // Every earlier version proved first and armed second, and the proof WAS the
+  // outage: the request arriving in the gap paid the whole of it. Measured on
+  // one shape, holder and proxy both killed — two 2s windows: 3,899ms. Three
+  // 250ms windows: 694ms. No window at all: 3ms, which is the steady state, so
+  // there is no gap left to measure.
+  //
+  // Being wrong is cheap and being slow is not. The only way to arm wrongly is
+  // for a proxy to have outlived our holder, and then both of us accept: ours
+  // carries to the same hop the proxy would have used, so those connections are
+  // served uncached rather than lost or delayed. That state is also
+  // self-clearing — the surviving proxy self-heals into a new holder, and a new
+  // holder takes the port by asking everything still on it to let go, which is
+  // what retires us. Measured across exactly that sequence: one standby before,
+  // one standby after.
+  //
+  // We do NOT stand down on our own. An earlier draft closed the server and
+  // exited when a probe returned 200, which is irreversible: the proxy that
+  // answered can die a moment later and there is no descriptor left to re-arm
+  // with. Measured on that draft — the address went to ECONNREFUSED in exactly
+  // the sequence this exists to survive. Yielding is the claimant's decision,
+  // made with SIGHUP, not ours.
+  const tick = () => {
+    if (process.ppid === bornOf) return void setTimeout(tick, 250);
+    carry();
+  };
+  setTimeout(tick, 100);
+}

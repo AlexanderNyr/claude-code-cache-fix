@@ -14,6 +14,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import net from "node:net";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,14 @@ import { startProxy } from "../proxy/server.mjs";
 const ENV_KEYS = [
   "CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR", "CACHE_FIX_PROXY_UPSTREAM",
   "CACHE_FIX_HTTPS_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy",
+  "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_REQUIRE_HOP",
+  "CACHE_FIX_CHAIN_GRACE_MS",
+  // NO_PROXY decides whether a host is exempt from the hop rules at all, so a
+  // case that does not control it inherits the developer's shell. Measured: the
+  // ambient value here is "localhost,127.0.0.1", which exempts every loopback
+  // fixture in this file — a REQUIRE_HOP case pointed at 127.0.0.1 therefore
+  // asserted against a code path that was never entered.
+  "NO_PROXY", "no_proxy",
   "PATH",
 ];
 
@@ -149,6 +158,339 @@ test("attach failure: non-core paths 404 (not passthrough), no self-heal install
     restoreEnv(saved);
     if (handle) await handle.close();
     upstream.close();
+    try { rmSync(caDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// A CONNECT MUST TRAVERSE THE FALLBACK CHAIN, NOT DIAL DIRECT.
+//
+// Live outage on the work Mac, found by cswap's pin: every `/login` failed with
+// UNABLE_TO_GET_ISSUER_CERT while plain HTTP was fine. The cause is one call
+// away from the fix — resolveHop() consults fallbackProxyUrls(), and its ONLY
+// caller was forwardRequest() (plain HTTP). Both CONNECT paths read
+// config.httpsProxy directly, which is fed by CACHE_FIX_UPSTREAM_PROXY /
+// HTTPS_PROXY and NEVER by CACHE_FIX_FALLBACK_PROXIES. With only the fallback
+// configured — the shipped wiring — that value is "" and CONNECT dialled
+// direct, straight into the corporate MITM.
+//
+// It hid for as long as it did because the host everyone probes is the one CCF
+// MITMs: api.anthropic.com goes down the relay path, comes back re-signed by
+// our own CA, and reads authorized=true. Only the hosts CCF does NOT MITM take
+// the blind tunnel, and those are exactly the login hosts. Measured on the work
+// Mac, same box, same minute:
+//   claude.ai / console.anthropic.com via 9901 -> UNABLE_TO_GET_ISSUER_CERT
+//   the same two              via 8118 -> authorized=true, Let's Encrypt
+//
+// AND THE TRANSPORT TO THE HOP MUST FOLLOW THE HOP'S OWN SCHEME.
+//
+// parseProxy() returned only { host, port }. The port was already defaulted from
+// the scheme (443 for https), so an `https://hop` was dialled on the RIGHT PORT
+// with the WRONG PROTOCOL: http.request sent a plaintext CONNECT line to a TLS
+// listener, which never answers one. The tunnel then hung to its timeout while
+// hopAlive()'s TCP probe kept saying the hop was fine, so the chain went on
+// picking it instead of falling through.
+//
+// forwardRequest's path never had this — buildAgent hands proxyUrl to
+// HttpsProxyAgent, which reads the scheme itself. One chain, dialled correctly
+// by one caller and in the clear by two others.
+//
+// FIRST BYTE ON THE WIRE, because it separates the two transports without
+// needing a certificate: a TLS ClientHello starts 0x16, an HTTP request line
+// starts 'C' (0x43). Both polarities, so making everything TLS fails the control.
+for (const [scheme, want, name] of [["https", 0x16, "TLS ClientHello"], ["http", 0x43, "a plain CONNECT line"]]) {
+  test(`a ${scheme}:// hop is dialled with ${name}`, async () => {
+    const saved = saveEnv();
+    const caDir = mkdtempSync(join(tmpdir(), "ccf-hop-scheme-"));
+    const seen = [];
+    const hop = net.createServer((sock) => {
+      sock.once("data", (d) => { seen.push(d[0]); sock.destroy(); });
+      sock.on("error", () => {});
+    });
+    const hopPort = await listen(hop);
+    const direct = net.createServer((sock) => sock.destroy());
+    const directPort = await listen(direct);
+
+    let handle;
+    try {
+      process.env.CACHE_FIX_FORWARD_PROXY = "on";
+      process.env.CACHE_FIX_CA_DIR = caDir;
+      process.env.CACHE_FIX_FALLBACK_PROXIES = `${scheme}://127.0.0.1:${hopPort}`;
+      for (const k of ["CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_HTTPS_PROXY",
+                       "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) delete process.env[k];
+      handle = await startProxy({ port: 0, watch: false });
+
+      const target = `127.0.0.1:${directPort}`;
+      await new Promise((resolve) => {
+        const req = http.request({ host: "127.0.0.1", port: handle.port, method: "CONNECT",
+                                   path: target, headers: { host: target } });
+        req.on("connect", (_res, socket) => { socket.destroy(); resolve(); });
+        req.on("error", () => resolve());
+        req.setTimeout(4_000, () => { req.destroy(); resolve(); });
+        req.end();
+      });
+      const by = Date.now() + 4_000;
+      while (!seen.length && Date.now() < by) await new Promise((r) => setTimeout(r, 50));
+
+      assert.equal(seen.length, 1, `the ${scheme}:// hop was never dialled at all`);
+      assert.equal(seen[0], want,
+        `the ${scheme}:// hop's first byte was 0x${seen[0].toString(16)}, expected ` +
+        `0x${want.toString(16)} (${name}) — the transport does not follow the scheme, so a ` +
+        `TLS hop is sent an HTTP request line it will never answer and the tunnel hangs ` +
+        `while hopAlive() still calls the hop healthy`);
+    } finally {
+      restoreEnv(saved);
+      if (handle) await handle.close();
+      hop.close(); direct.close();
+      try { rmSync(caDir, { recursive: true, force: true }); } catch {}
+    }
+  });
+}
+
+// A stand-in CONNECT proxy rather than a real hop: the assertion is WHICH
+// SOCKET the tunnel is opened on, and a listener that records the CONNECT line
+// answers that without TLS, a CA, or the network.
+test("CONNECT traverses the fallback chain when only a fallback is configured", async () => {
+  const saved = saveEnv();
+  const caDir = mkdtempSync(join(tmpdir(), "ccf-connect-fallback-"));
+  const seen = [];
+  // The fallback hop. Speaks just enough CONNECT to be chosen and to record it.
+  const hop = net.createServer((sock) => {
+    sock.once("data", (d) => {
+      seen.push(String(d).split("\r\n")[0]);
+      sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      sock.end();
+    });
+    sock.on("error", () => {});
+  });
+  const hopPort = await listen(hop);
+  // Where a DIRECT dial would land. Nothing may reach it.
+  const direct = net.createServer((sock) => { seen.push("DIRECT"); sock.destroy(); });
+  const directPort = await listen(direct);
+
+  let handle;
+  try {
+    process.env.CACHE_FIX_FORWARD_PROXY = "on";
+    process.env.CACHE_FIX_CA_DIR = caDir;
+    // The shipped shape: a fallback and NOTHING else. Every variable that feeds
+    // config.httpsProxy is cleared, because inheriting one here would let the
+    // old code pass for the wrong reason.
+    process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${hopPort}`;
+    for (const k of ["CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_HTTPS_PROXY",
+                     "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) delete process.env[k];
+
+    handle = await startProxy({ port: 0, watch: false });
+
+    // A host CCF does not MITM, so this is the blind tunnel — the failing path.
+    const target = `127.0.0.1:${directPort}`;
+    await new Promise((resolve) => {
+      const req = http.request({ host: "127.0.0.1", port: handle.port, method: "CONNECT",
+                                 path: target, headers: { host: target } });
+      req.on("connect", (_res, socket) => { socket.destroy(); resolve(); });
+      req.on("error", () => resolve());
+      req.setTimeout(4_000, () => { req.destroy(); resolve(); });
+      req.end();
+    });
+    await new Promise((r) => setTimeout(r, 150));   // let the hop record it
+
+    assert.ok(!seen.includes("DIRECT"),
+      "CONNECT dialled the target directly, bypassing the configured fallback — " +
+      "this is the work-Mac outage: every non-MITM'd host lands on the corporate proxy");
+    assert.deepEqual(seen, [`CONNECT ${target} HTTP/1.1`],
+      `CONNECT did not go through the fallback hop; saw ${JSON.stringify(seen)}`);
+  } finally {
+    restoreEnv(saved);
+    if (handle) await handle.close();
+    hop.close(); direct.close();
+    try { rmSync(caDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// FALLING OPEN IS THE DEFAULT AND MUST STAY THE DEFAULT — a hop that is
+// restarting is back in ~1s, and refusing meanwhile strands a session whose
+// HTTPS_PROXY was baked at exec, which is the outage the whole chain exists to
+// avoid.
+//
+// But where the hop is a POLICY boundary rather than a cache, a direct dial is
+// a silent bypass: the client is handed "200 Connection Established" and has no
+// way to tell the tunnel left unproxied. CACHE_FIX_REQUIRE_HOP=1 is the opt-in
+// that turns it into an error.
+//
+// BOTH DIRECTIONS IN ONE CASE, because either alone passes for the wrong
+// reason: assert only the refusal and a proxy that refuses unconditionally
+// looks correct; assert only the fall-through and so does one that never
+// refuses. The hop here is a CLOSED port, so the chain genuinely has nothing to
+// reach and the difference is entirely the variable.
+test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says otherwise", async () => {
+  const saved = saveEnv();
+  const caDir = mkdtempSync(join(tmpdir(), "ccf-require-hop-"));
+  const seen = [];
+  // EVERY endpoint records, not only the one under assertion. An empty `seen`
+  // says a connection did not arrive HERE; it cannot say where it went instead,
+  // and an assertion firing on `[]` has already discarded the evidence that
+  // would narrow it. Measured today: this case failed with `actual: []` and
+  // cost a round to learn the CONNECT had not been tunnelled at all.
+  //
+  // WHAT IT BUYS, stated precisely rather than overclaimed: `trace` separates
+  // "reached a DIFFERENT endpoint" from "reached NO endpoint". It does not name
+  // the third case — the proxy MITM'ing the target itself, which touches
+  // nothing downstream and is what the loopback-upstream mutation actually
+  // produces. `[]` versus `["UPSTREAM"]` is still the distinction that was
+  // missing, and it is one grep instead of a round.
+  //
+  // Shape borrowed from cswap's pin, who found the same class in their suite
+  // the same day: when an assertion discards the evidence, the fix is a
+  // tripwire that survives it, not a louder message on the same assertion.
+  const trace = [];
+  // Where a direct dial lands. Reaching it is the fail-OPEN outcome.
+  const direct = net.createServer((sock) => { seen.push("DIRECT"); trace.push("DIRECT"); sock.destroy(); });
+  const directPort = await listen(direct);
+  // A LOCAL upstream that answers unmistakably. Without it config.upstream is
+  // the real https://api.anthropic.com and the relayed probe below dials it for
+  // real — measured as a CI regression: the run that added this probe went red
+  // on node 22 while the identical code without it was green, and
+  // integrated.conf line 20 already warns that an unproxied test here "hangs on
+  // this network until it times out". 418 is a status nothing else in this
+  // chain produces, so reaching it cannot be confused with a refusal.
+  const upstream = http.createServer((_q, r) => { r.writeHead(418); r.end("teapot"); });
+  upstream.on("connection", () => trace.push("UPSTREAM"));
+  await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+  // A hop address with nothing behind it: the whole chain refuses.
+  // A PORT NOTHING CAN TAKE, not one we happened to let go of. Binding an
+  // ephemeral port and closing it leaves a number the kernel is free to hand to
+  // the next asker, and this file's own fixtures ask for ephemeral ports
+  // constantly — the suite allocates ~55 of them per run before counting the
+  // proxies and standbys each one spawns. A neighbour that lands on this exact
+  // number turns "the whole chain refuses" into "the chain has a live hop", and
+  // the case then measures something it never meant to.
+  //
+  // Not a theoretical worry: measured here by binding it deliberately, the case
+  // stopped failing cleanly and HUNG instead — `--test-timeout=0` means nothing
+  // ends it — where unoccupied it finishes in about four seconds.
+  //
+  // Port 1 cannot be taken by anything in this suite: binding below 1024 needs
+  // privilege and the runner is unprivileged (uid 1910859 here, and GitHub's
+  // runners do not run tests as root either). Connecting to it refuses in ~2ms,
+  // which is what a dead hop is supposed to do — so this is strictly more
+  // faithful than the port we used to free and hope stayed free.
+  const deadPort = 1;
+
+  let handle;
+  const connect = (port, target) => new Promise((resolve) => {
+    const req = http.request({ host: "127.0.0.1", port, method: "CONNECT",
+                               path: target, headers: { host: target } });
+    // Node fires 'connect' even for a denial, which is how the status reaches us.
+    req.on("connect", (res, socket) => { socket.destroy(); resolve(res.statusCode); });
+    req.on("error", (e) => resolve(`ERR:${e.code}`));
+    req.setTimeout(4_000, () => { req.destroy(); resolve("TIMEOUT"); });
+    req.end();
+  });
+
+  try {
+    process.env.CACHE_FIX_FORWARD_PROXY = "on";
+    process.env.CACHE_FIX_CA_DIR = caDir;
+    process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${deadPort}`;
+    // THE GRACE IS PAID, and the comment that used to sit here said it was not.
+    // CHAIN_GRACE_MS is a module-level const captured at import, so setting the
+    // env after upstream.mjs is already loaded changes nothing — measured, this
+    // case runs 2,616 ms, which is one full 2,500 ms default window. Setting it
+    // anyway and calling the retry loop "not under test" was a lie in a comment,
+    // which is worse than the 2.5 s: it tells the next reader the wait is gone.
+    // Not worth a production getter — an operator sets this before the proxy
+    // starts, which is the only moment it is read, and that path works.
+    for (const k of ["CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_HTTPS_PROXY",
+                     "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) delete process.env[k];
+    delete process.env.CACHE_FIX_REQUIRE_HOP;
+
+    handle = await startProxy({ port: 0, watch: false });
+    const target = `127.0.0.1:${directPort}`;
+    assert.equal(await connect(handle.port, target), 200,
+      "the default refused a tunnel instead of falling open — a hop restarting " +
+      "would strand every session wired to this proxy");
+    await new Promise((r) => setTimeout(r, 100));
+    assert.deepEqual(seen, ["DIRECT"],
+      `the fail-open path did not reach the target; endpoints touched: ${JSON.stringify(trace)} ` +
+      `(empty = the tunnel reached NO endpoint, so the proxy handled it rather than forwarding it)`);
+    await handle.close(); handle = undefined;
+
+    // Same chain, same dead hop, opt-in on.
+    seen.length = 0;
+    process.env.CACHE_FIX_REQUIRE_HOP = "1";
+    handle = await startProxy({ port: 0, watch: false });
+    assert.equal(await connect(handle.port, target), 502,
+      "CACHE_FIX_REQUIRE_HOP=1 still handed the client a tunnel");
+    await new Promise((r) => setTimeout(r, 100));
+    assert.deepEqual(seen, [],
+      "CACHE_FIX_REQUIRE_HOP=1 dialled the target directly anyway — the bypass " +
+      `this variable exists to close; endpoints touched: ${JSON.stringify(trace)}`);
+
+    // THE RELAYED PATH IS COVERED NOW, and this assertion is what changed when
+    // it became so. It read 418 — the upstream fixture answering, i.e. the
+    // request leaving with the operator's key and no hop, under a comment that
+    // called the gap deliberate.
+    //
+    // The reason it was left open died before the gap did. That reason: throwing
+    // in forwardRequest would HANG the client, because handleMessages' catch
+    // opens `if (abortController.signal.aborted) return` and the abort fired on
+    // clientReq's own "close" — which Node emits when the request BODY
+    // completes, not only when the client leaves. True when written. At HEAD the
+    // listener keys off clientRes' "close" gated by writableEnded, so it
+    // separates "we answered" from "client gone" and never fires on a finished
+    // body; the throw now lands in the same catch and becomes the 502 asserted
+    // below. All three forwardRequest call sites in server.mjs do the same.
+    //
+    // So the CONNECT paths and the relayed path finally agree: with
+    // CACHE_FIX_REQUIRE_HOP=1 and no reachable hop, nothing leaves this process.
+    // ITS OWN INSTANCE. Pointing config.upstream at loopback for the whole case
+    // breaks the CONNECT half above — the forward proxy then reads the tunnel
+    // target 127.0.0.1:<port> as the upstream host and stops blind-tunnelling
+    // it, so `seen` came back empty and the fail-open assertion failed for a
+    // reason that had nothing to do with fail-open.
+    await handle.close();
+    process.env.CACHE_FIX_PROXY_UPSTREAM = `http://127.0.0.1:${upstream.address().port}`;
+    // NO_PROXY CLEARED, or this case tests nothing. The upstream fixture must be
+    // loopback to be controllable, and the ambient NO_PROXY on a dev box is
+    // "localhost,127.0.0.1" — so shouldBypassProxy() answers true, the request
+    // is exempt from the hop rules by design, and the refusal below never runs.
+    // The first cut of this assertion failed for exactly that reason and read as
+    // "the guard does not work".
+    delete process.env.NO_PROXY;
+    delete process.env.no_proxy;
+    handle = await startProxy({ port: 0, watch: false });
+    const relayed = await new Promise((resolve) => {
+      const r = http.request({ host: "127.0.0.1", port: handle.port, method: "POST",
+                               path: "/v1/messages", headers: { "content-type": "application/json" } },
+        (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); });
+      r.on("error", (e) => resolve(`ERR:${e.code}`));
+      r.setTimeout(4_000, () => { r.destroy(); resolve("TIMEOUT"); });
+      r.end("{}");
+    });
+    // PREMISE, and this case had none: with the upstream exempt from the hop
+    // rules the refusal is correct to skip, so a 418 would mean "not applicable"
+    // while reading as "the guard failed".
+    assert.ok(!process.env.NO_PROXY && !process.env.no_proxy,
+      "premise: NO_PROXY must not exempt the loopback upstream, or the refusal " +
+      "below is never reached and this case asserts nothing");
+    assert.equal(process.env.CACHE_FIX_REQUIRE_HOP, "1",
+      "premise: the variable under test is not set");
+    assert.equal(relayed, 502,
+      `the relayed path answered ${relayed}. 418 is the upstream fixture, which ` +
+      `means the request LEFT this process carrying the caller's credentials with ` +
+      `CACHE_FIX_REQUIRE_HOP=1 and no hop reachable — the exact egress the variable ` +
+      `exists to forbid, and which the CONNECT paths above already refuse`);
+    await new Promise((r) => setTimeout(r, 100));
+    // `trace`, NOT `seen`: only the `direct` fixture pushes to seen, and the
+    // relayed request targets the `upstream` one — so asserting on seen here
+    // could not fail no matter what the proxy did. The upstream fixture records
+    // into trace, which is the log that can actually witness this dial.
+    assert.ok(!trace.some((t) => /UPSTREAM/i.test(String(t))),
+      `the relayed path reached the upstream before answering: ${JSON.stringify(trace)}. ` +
+      `A 502 that dialled first and failed later is not a refusal — the request ` +
+      `left this process carrying the caller's credentials`);
+
+  } finally {
+    restoreEnv(saved);
+    if (handle) await handle.close();
+    direct.close(); upstream.close();
     try { rmSync(caDir, { recursive: true, force: true }); } catch {}
   }
 });
