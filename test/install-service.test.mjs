@@ -1,3 +1,4 @@
+import { createServer } from "node:net";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile, rm, readdir, mkdir } from "node:fs/promises";
@@ -809,10 +810,26 @@ test("dispatch back-compat: --proxy-port + claude-arg passes through to wrapper 
     interceptScript,
     'process.stdout.write("INTERCEPT:" + JSON.stringify({argv: process.argv.slice(2), base: process.env.ANTHROPIC_BASE_URL}));\n',
   );
+  // This case asserts on the URL, but the wrapper really BINDS the port, so a
+  // hardcoded one fails whenever anything else on the machine already holds
+  // it — observed with a local QGIS MCP server owning 9876, which turned this
+  // into a red suite on an unrelated change. `--proxy-port 0` is not usable
+  // here because the assertion needs the number it passed in, so take a free
+  // port from the OS and use that. There is a small TOCTOU window between
+  // closing the probe socket and the wrapper binding; it is far narrower than
+  // a fixed port's collision surface.
+  const port = await new Promise((resolve, reject) => {
+    const s = createServer();
+    s.on("error", reject);
+    s.listen(0, "127.0.0.1", () => {
+      const { port: p } = s.address();
+      s.close(() => resolve(p));
+    });
+  });
   try {
     const { stdout } = await execFileP(
       process.execPath,
-      [BIN, "--proxy-port", "9876", "some-claude-arg", "--another"],
+      [BIN, "--proxy-port", String(port), "some-claude-arg", "--another"],
       {
         env: {
           ...process.env,
@@ -825,7 +842,7 @@ test("dispatch back-compat: --proxy-port + claude-arg passes through to wrapper 
     assert.ok(match, `expected wrapper-intercept JSON in stdout; got: ${JSON.stringify(stdout)}`);
     const parsed = JSON.parse(match[1]);
     assert.deepEqual(parsed.argv, ["some-claude-arg", "--another"], "wrapper-mode args must reach the claude command");
-    assert.equal(parsed.base, "http://127.0.0.1:9876", "ANTHROPIC_BASE_URL must reflect --proxy-port");
+    assert.equal(parsed.base, `http://127.0.0.1:${port}`, "ANTHROPIC_BASE_URL must reflect --proxy-port");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
